@@ -5,24 +5,30 @@
 -- Channel Count):
 --   Input > Gain > Delay > Low (Shelf or High-Pass) > EQ (Parametric or Graphic)
 --         > High (Shelf or Low-Pass) > Peak Limiter > Output
--- Delay, Low, EQ, High and Limiter can each be removed with properties.
+-- Low, EQ and High can be removed with properties. Delay and Limiter are always
+-- available. Each stage defaults to bypass on new instances.
 -- An embedded Level Meter (True Peak/RMS, dBFS) taps the signal before the
 -- first section and after every section, so every section has a meter before
--- and after it.
+-- and after it. Single Meter defaults to the loudest channel at each tap;
+-- disable it for individual channel meters (the audio is never summed).
 --
 -- Pages:
 --   Strip - every section in signal order, meters between sections.
---   EQ    - live response graph (Low + EQ + High), full Low/EQ/High controls,
---           meters before/after each of them. Only when one of them is enabled.
+--   EQ    - live response graph (Low + EQ + High), full Low/EQ/High controls.
+--           Metering stays on Strip. Only when one EQ section is enabled.
 --
--- The response graph is drawn at runtime as an SVG (EzSVG) in a button legend.
+-- The response graph is drawn as SVG in bounded timer-driven chunks.
+-- Dashed curves preview bypassed processing; white is the active response.
+-- Static grid and sampled filter paths are cached; only changed filters are
+-- recalculated. First renders and bulk preset changes take more timer ticks.
+-- Graphic EQ frequency coordinates are anchored to the fader centres.
 -- It is calculated from the control values (RBJ biquads at 48 kHz), so it is a
 -- close approximation of the native response panel, not a measurement.
 
 PluginInfo = {
     Name = "Output Channel Strip",
-    Version = "1.0.0",
-    BuildVersion = "1.0.0",
+    Version = "1.0.6",
+    BuildVersion = "1.0.6",
     Id = "1697da51-87cc-40a5-89fe-9a795dac3853",
     Author = "James Martin",
     Description = "Output channel strip: gain, delay, low/high shelf or filter, parametric or graphic EQ, peak limiter, with meters between every section."
@@ -33,7 +39,7 @@ PluginInfo = {
 -- CONSTANTS
 ------------------------------------------------------------
 
-MAX_CHANNELS = 32
+MAX_CHANNELS = 8
 
 SECTION_OFF    = "Off"
 SECTION_SHELF  = "Shelf"
@@ -70,6 +76,14 @@ MUTE_COLOR      = { 255, 0, 0 }
 INVERT_COLOR    = { 255, 245, 123 }
 FLAT_COLOR      = { 200, 200, 200 }
 ENTRY_COLOR     = { 255, 251, 195 }
+DSP_COLORS = {
+    gain = { 177, 222, 241 },
+    delay = { 211, 230, 169 },
+    low = { 241, 163, 192 },
+    eq = { 241, 163, 192 },
+    high = { 241, 163, 192 },
+    limiter = { 216, 181, 208 }
+}
 
 
 ------------------------------------------------------------
@@ -115,14 +129,14 @@ end
 
 
 function GainRange(props)
-    local maxDb = Clamp(PropNumber(props, "Max Gain (dB)", 20), -99, 20)
-    local minDb = Clamp(PropNumber(props, "Min Gain (dB)", -60), -100, maxDb - 1)
-    return minDb, maxDb
+    return -100, 20
 end
 
 
-function DelayEnabled(props) return PropBool(props, "Delay", true) end
-function LimiterEnabled(props) return PropBool(props, "Limiter", true) end
+function DelayEnabled(props) return true end
+function LimiterEnabled(props) return true end
+function SingleMeter(props) return PropBool(props, "Single Meter", true) end
+function MeterCount(props) return SingleMeter(props) and 1 or ChannelCount(props) end
 function DebugEnabled(props) return PropBool(props, "Debug Print", false) end
 function LowMode(props) return PropValue(props, "Low Section", SECTION_SHELF) end
 function HighMode(props) return PropValue(props, "High Section", SECTION_SHELF) end
@@ -130,7 +144,7 @@ function EqMode(props) return PropValue(props, "EQ Type", EQ_PARAMETRIC) end
 
 
 function MaxDelaySeconds(props)
-    return Clamp(PropNumber(props, "Max Delay (ms)", 500), 1, 2000) / 1000
+    return Clamp(PropNumber(props, "Max Delay (ms)", 100), 1, 2000) / 1000
 end
 
 
@@ -285,10 +299,8 @@ end
 function GetProperties()
     return {
         { Name = "Channel Count", Type = "integer", Min = 1, Max = MAX_CHANNELS, Value = 2 },
-        { Name = "Max Gain (dB)", Type = "integer", Min = -99, Max = 20, Value = 20 },
-        { Name = "Min Gain (dB)", Type = "integer", Min = -100, Max = 19, Value = -60 },
-        { Name = "Delay", Type = "boolean", Value = true },
-        { Name = "Max Delay (ms)", Type = "integer", Min = 1, Max = 2000, Value = 500 },
+        { Name = "Single Meter", Type = "boolean", Value = true },
+        { Name = "Max Delay (ms)", Type = "integer", Min = 1, Max = 2000, Value = 100 },
         { Name = "Low Section", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
         { Name = "Low Shelf Slope", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
         { Name = "Low Filter Max Slope", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
@@ -298,14 +310,13 @@ function GetProperties()
         { Name = "High Section", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
         { Name = "High Shelf Slope", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
         { Name = "High Filter Max Slope", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
-        { Name = "Limiter", Type = "boolean", Value = true },
         { Name = "Debug Print", Type = "boolean", Value = false }
     }
 end
 
 
 function RectifyProperties(props)
-    props["Max Delay (ms)"].IsHidden = not DelayEnabled(props)
+    props["Single Meter"].IsHidden = ChannelCount(props) == 1
     props["Low Shelf Slope"].IsHidden = LowMode(props) ~= SECTION_SHELF
     props["Low Filter Max Slope"].IsHidden = LowMode(props) ~= SECTION_FILTER
     props["High Shelf Slope"].IsHidden = HighMode(props) ~= SECTION_SHELF
@@ -442,9 +453,13 @@ function GetControls(props)
         controls[#controls + 1] = t
     end
 
-    local function toggle(name) add({ Name = name, ControlType = "Button", ButtonType = "Toggle" }) end
+    local function toggle(name)
+        add({ Name = name, ControlType = "Button", ButtonType = "Toggle",
+              DefaultValue = name:match("_bypass$") ~= nil })
+    end
 
     -- Gain
+    toggle("gain_bypass")
     add({ Name = "gain", ControlType = "Knob", ControlUnit = "dB", Min = minDb, Max = maxDb, DefaultValue = Clamp(0, minDb, maxDb) })
     toggle("mute")
     toggle("invert")
@@ -503,10 +518,11 @@ function GetControls(props)
         add({ Name = "limiter_threshold", ControlType = "Knob", ControlUnit = "dB", Min = -60, Max = 20, DefaultValue = 0 })
         add({ Name = "limiter_attack", ControlType = "Knob", ControlUnit = "Seconds", Min = 0.0001, Max = 0.1, DefaultValue = 0.01 })
         add({ Name = "limiter_release", ControlType = "Knob", ControlUnit = "Seconds", Min = 0.001, Max = 5, DefaultValue = 0.1 })
-        add({ Name = "limiter_gr", ControlType = "Indicator", IndicatorType = "Meter", Min = GR_MIN, Max = GR_MAX, PinStyle = "Output" })
+        add({ Name = "limiter_gr", ControlType = "Knob", ControlUnit = "dB",
+              Min = GR_MIN, Max = 0, DefaultValue = 0, PinStyle = "Output" })
     end
 
-    local channels = ChannelCount(props)
+    local channels = MeterCount(props)
     for _, tap in ipairs(MeterTaps(props)) do
         add({ Name = MeterControl(tap.id), ControlType = "Indicator", IndicatorType = "Meter",
               Min = METER_MIN, Max = METER_MAX, Count = channels, PinStyle = "Output" })
@@ -515,8 +531,6 @@ function GetControls(props)
     if EqPageEnabled(props) then
         add({ Name = "eq_graph", ControlType = "Button", ButtonType = "Trigger", PinStyle = "None", UserPin = false })
     end
-
-    add({ Name = "status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output" })
 
     return controls
 end
@@ -539,7 +553,6 @@ CONTENT = 20         -- group content starts this far below the group top
 GAP = 4              -- between groups
 METER_TOP = 24       -- meter area relative to group top
 METER_H = 232
-STATUS_H = 16
 
 
 function AddGroup(graphics, text, x, y, w, h, fill)
@@ -548,6 +561,11 @@ function AddGroup(graphics, text, x, y, w, h, fill)
         Color = LABEL_COLOR, Fill = fill or GROUP_FILL, StrokeColor = { 160, 160, 170 }, StrokeWidth = 1,
         CornerRadius = 6, Position = { x, y }, Size = { w, h }
     })
+end
+
+
+function SectionFill(props, id)
+    return CurrentPage(props) == "Strip" and DSP_COLORS[id] or GROUP_FILL
 end
 
 
@@ -597,46 +615,36 @@ end
 
 
 function MeterColumnWidth(props)
-    local _, _, total = MeterGeometry(ChannelCount(props))
+    local _, _, total = MeterGeometry(MeterCount(props))
     return math.max(40, total + 12)
 end
 
 
 -- Column of per-channel meters for one tap. Returns its width.
 function MeterColumn(props, layout, graphics, tap, label, x, y)
-    local n = ChannelCount(props)
+    local n = MeterCount(props)
     local w, gap, total = MeterGeometry(n)
     local colW = MeterColumnWidth(props)
 
-    AddGroup(graphics, label, x, y, colW, GROUP_H, METER_FILL)
+    AddGroup(graphics, (tap == "in" or label == "Out") and label or "", x, y, colW, GROUP_H, METER_FILL)
 
     local mx = x + math.floor((colW - total) / 2)
     for ch = 1, n do
         layout[ControlName(MeterControl(tap), n, ch)] = MeterEntry(
-            "Meters~" .. label .. "~Channel " .. ch, mx + (ch - 1) * (w + gap), y + METER_TOP, w, METER_H)
+            "Meters~" .. label .. (SingleMeter(props) and "~Loudest Channel" or ("~Channel " .. ch)),
+            mx + (ch - 1) * (w + gap), y + METER_TOP, w, METER_H)
     end
 
     return colW
 end
 
 
--- dB scale beside the first meter column on the Strip page.
-function ScaleColumn(graphics, x, y)
-    local w = 36
-    AddGroup(graphics, "dB", x, y, w, GROUP_H, METER_FILL)
-    for db = METER_MAX, METER_MIN, -10 do
-        local py = y + METER_TOP + math.floor((METER_MAX - db) / (METER_MAX - METER_MIN) * METER_H + 0.5)
-        AddLabel(graphics, tostring(db), x + 2, Clamp(py - 8, y + METER_TOP, y + METER_TOP + METER_H - 16), w - 6, 16, "Right")
-    end
-    return w
-end
-
-
 function GainColumn(props, layout, graphics, x, y)
     local w = 76
     local c = y + CONTENT
-    AddGroup(graphics, "Gain", x, y, w, GROUP_H)
-    layout["gain"] = FaderEntry("Gain~Gain", x + 14, c, 48, 200)
+    AddGroup(graphics, "Gain", x, y, w, GROUP_H, SectionFill(props, "gain"))
+    layout["gain_bypass"] = ButtonEntry("Gain~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
+    layout["gain"] = FaderEntry("Gain~Gain", x + 14, c + 24, 48, 176)
     layout["mute"] = ButtonEntry("Gain~Mute", "Mute", MUTE_COLOR, x + 6, c + 208, w - 12)
     layout["invert"] = ButtonEntry("Gain~Invert", "Invert", INVERT_COLOR, x + 6, c + 228, w - 12)
     return w
@@ -646,7 +654,7 @@ end
 function DelayColumn(props, layout, graphics, x, y)
     local w = 76
     local c = y + CONTENT
-    AddGroup(graphics, "Delay", x, y, w, GROUP_H)
+    AddGroup(graphics, "Delay", x, y, w, GROUP_H, SectionFill(props, "delay"))
     layout["delay_bypass"] = ButtonEntry("Delay~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
     AddLabel(graphics, "Time", x + 6, c + 24, w - 12)
     layout["delay"] = TextEntry("Delay~Delay", x + 6, c + 44, w - 12)
@@ -667,7 +675,7 @@ function ShelfFilterColumn(props, layout, graphics, side, x, y)
     local w = 92
     local c = y + CONTENT
     local inner = w - 12
-    AddGroup(graphics, title, x, y, w, GROUP_H)
+    AddGroup(graphics, title, x, y, w, GROUP_H, SectionFill(props, side))
 
     layout[side .. "_bypass"] = ButtonEntry(title .. "~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, inner)
 
@@ -696,7 +704,7 @@ end
 function EqSummaryColumn(props, layout, graphics, x, y)
     local w = 76
     local c = y + CONTENT
-    AddGroup(graphics, "EQ", x, y, w, GROUP_H)
+    AddGroup(graphics, "EQ", x, y, w, GROUP_H, SectionFill(props, "eq"))
     layout["eq_bypass"] = ButtonEntry("EQ~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
     layout["eq_flat"] = ButtonEntry("EQ~Flat", "Flat", FLAT_COLOR, x + 6, c + 20, w - 12)
     AddLabel(graphics, EqMode(props), x + 6, c + 44, w - 12)
@@ -709,12 +717,13 @@ end
 function LimiterColumn(props, layout, graphics, x, y)
     local w = 108
     local c = y + CONTENT
-    AddGroup(graphics, "Limiter", x, y, w, GROUP_H)
+    AddGroup(graphics, "Limiter", x, y, w, GROUP_H, SectionFill(props, "limiter"))
     layout["limiter_bypass"] = ButtonEntry("Limiter~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
     AddLabel(graphics, "Thresh", x + 6, c + 24, 56)
     AddLabel(graphics, "GR", x + 70, c + 24, 32)
     layout["limiter_threshold"] = FaderEntry("Limiter~Threshold", x + 10, c + 44, 48, 156)
     layout["limiter_gr"] = MeterEntry("Limiter~Gain Reduction", x + 78, c + 44, 16, 140, "Reduction")
+    layout["limiter_gr"].IsReadOnly = true
     AddLabel(graphics, "Attack", x + 6, c + 208, 44, 16, "Left")
     layout["limiter_attack"] = TextEntry("Limiter~Attack", x + 52, c + 208, w - 58)
     AddLabel(graphics, "Release", x + 6, c + 228, 44, 16, "Left")
@@ -758,7 +767,7 @@ function GraphicColumns(props, layout, graphics, x, y)
     local names = GraphicBandNames(props)
     local n = #names
     local bandW = 24
-    local w = math.max(120, n * bandW + 16)
+    local w = math.max(120, n * bandW + 32)
     local c = y + CONTENT
     local x0 = x + math.floor((w - n * bandW) / 2)
 
@@ -773,8 +782,8 @@ function GraphicColumns(props, layout, graphics, x, y)
             Position = { bx + 2, c }, Size = { bandW - 4, 204 }
         }
         -- Alternate label rows so wide labels never collide.
-        local row = (n > 11) and ((i - 1) % 2) or 0
-        local lw = (n > 11) and (bandW * 2 - 4) or (bandW + 8)
+        local row = (i - 1) % 2
+        local lw = bandW * 2 - 4
         AddLabel(graphics, ShortBandName(name), bx + math.floor((bandW - lw) / 2), c + 208 + row * 16, lw)
     end
 
@@ -787,12 +796,48 @@ GRAPH_LEFT = 36      -- room for dB labels
 GRAPH_H = 156
 
 
-function GraphRect(rowW)
+function GraphRect(rowW, props)
+    if props and EqMode(props) == EQ_GRAPHIC then
+        local first = GraphicFrequencyMap(props)[1]
+        return first.x - 12, TOP + CONTENT, EqBandCount(props) * 24, GRAPH_H
+    end
     return GRAPH_LEFT + 4, TOP + CONTENT, math.max(300, rowW - GRAPH_LEFT - 8), GRAPH_H
 end
 
 
-function GraphX(f, gx, gw)
+-- Graphic band labels are nominal rounded frequencies, so interpolate in log
+-- frequency between actual fader centres rather than assuming exact octaves.
+function GraphicFrequencyMap(props)
+    local names = GraphicBandNames(props)
+    local x = GRAPH_LEFT + 4
+    if HasSection(props, "low") then
+        x = x + 92 + GAP
+    end
+    local nodes = {}
+    for i, name in ipairs(names) do
+        nodes[i] = { frequency = math.log(BandFrequency(name)), x = x + 28 + (i - 1) * 24 }
+    end
+    return nodes
+end
+
+
+function GraphicFrequencyX(props, f, nodes)
+    nodes = nodes or GraphicFrequencyMap(props)
+    local logf = math.log(f)
+    local lo, hi = 1, #nodes - 1
+    while lo < hi do
+        local mid = (lo + hi) // 2
+        if logf <= nodes[mid + 1].frequency then hi = mid else lo = mid + 1 end
+    end
+    local a, b = nodes[lo], nodes[lo + 1]
+    return a.x + (logf - a.frequency) / (b.frequency - a.frequency) * (b.x - a.x)
+end
+
+
+function GraphX(f, gx, gw, props)
+    if props and EqMode(props) == EQ_GRAPHIC then
+        return GraphicFrequencyX(props, f)
+    end
     local t = (math.log(f, 10) - math.log(GRAPH_FMIN, 10)) / (math.log(GRAPH_FMAX, 10) - math.log(GRAPH_FMIN, 10))
     return gx + t * gw
 end
@@ -809,19 +854,10 @@ function EqPage(props, layout, graphics)
     graphics = graphics or {}
 
     local rowY = TOP + CONTENT + GRAPH_H + 24 + GAP
-    local x = 4
-    local taps = {}
-
-    local function meters(tap, label)
-        x = x + MeterColumn(props, layout, graphics, tap, label, x, rowY) + GAP
-    end
-
-    local first = HasSection(props, "low") and "low" or HasSection(props, "eq") and "eq" or "high"
-    meters(TapBefore(props, first), "Pre")
+    local x = GRAPH_LEFT + 4
 
     if HasSection(props, "low") then
         x = x + ShelfFilterColumn(props, layout, graphics, "low", x, rowY) + GAP
-        meters("low", "Low")
     end
 
     if HasSection(props, "eq") then
@@ -830,18 +866,15 @@ function EqPage(props, layout, graphics)
         else
             x = x + GraphicColumns(props, layout, graphics, x, rowY) + GAP
         end
-        meters("eq", "EQ")
     end
 
     if HasSection(props, "high") then
         x = x + ShelfFilterColumn(props, layout, graphics, "high", x, rowY) + GAP
-        meters("high", "High")
     end
 
     local rowW = math.max(x - GAP, 360)
 
-    -- Response graph across the full row width.
-    local gx, gy, gw, gh = GraphRect(rowW)
+    local gx, gy, gw, gh = GraphRect(rowW, props)
     table.insert(graphics, 1, {
         Type = "GroupBox", Text = "Response (approx.)", HTextAlign = "Left", FontSize = 11,
         Color = LABEL_COLOR, Fill = GROUP_FILL, StrokeColor = { 160, 160, 170 }, StrokeWidth = 1,
@@ -850,23 +883,28 @@ function EqPage(props, layout, graphics)
 
     for db = GRAPH_DB, -GRAPH_DB, -10 do
         local py = math.floor(GraphY(db, gy, gh) + 0.5)
-        AddLabel(graphics, (db > 0 and "+" or "") .. db, 6, Clamp(py - 8, gy, gy + gh - 16), GRAPH_LEFT - 6, 16, "Right")
+        AddLabel(graphics, (db > 0 and "+" or "") .. db, gx - GRAPH_LEFT + 2,
+            Clamp(py - 8, gy, gy + gh - 16), GRAPH_LEFT - 6, 16, "Right")
     end
 
-    for _, f in ipairs({ 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000 }) do
-        local px = math.floor(GraphX(f, gx, gw) + 0.5)
+    local lastLabelEnd = gx - 2
+    local frequencies = EqMode(props) == EQ_GRAPHIC
+        and { 16, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 16000 }
+        or { 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000 }
+    for _, f in ipairs(frequencies) do
+        local px = math.floor(GraphX(f, gx, gw, props) + 0.5)
         local text = f >= 1000 and (tostring(f // 1000) .. "k") or tostring(f)
-        AddLabel(graphics, text, Clamp(px - 15, gx, gx + gw - 30), gy + gh + 2, 30)
+        local left = Clamp(px - 15, gx, gx + gw - 30)
+        if px >= gx and px <= gx + gw and left >= lastLabelEnd + 2
+            and (f == frequencies[#frequencies] or left + 30 <= gx + gw - 32) then
+            AddLabel(graphics, text, left, gy + gh + 2, 30)
+            lastLabelEnd = left + 30
+        end
     end
 
     layout["eq_graph"] = {
         PrettyName = "EQ~Response Graph", Style = "Button", ButtonStyle = "Trigger", ButtonVisualStyle = "Flat",
         Color = { 30, 32, 38 }, IsReadOnly = true, Position = { gx, gy }, Size = { gw, gh }
-    }
-
-    layout["status"] = {
-        PrettyName = "Status", Style = "Text", FontSize = 11, IsReadOnly = true,
-        Position = { 4, rowY + GROUP_H + GAP }, Size = { rowW - 4, STATUS_H }
     }
 
     return rowW
@@ -884,7 +922,6 @@ function StripPage(props, layout, graphics)
         tapIndex = tapIndex + 1
     end
 
-    x = x + ScaleColumn(graphics, x, y) + GAP
     meters()
 
     for _, s in ipairs(Sections(props)) do
@@ -902,10 +939,6 @@ function StripPage(props, layout, graphics)
         meters()
     end
 
-    layout["status"] = {
-        PrettyName = "Status", Style = "Text", FontSize = 11, IsReadOnly = true,
-        Position = { 4, y + GROUP_H + GAP }, Size = { x - GAP - 4, STATUS_H }
-    }
 end
 
 
@@ -1097,18 +1130,7 @@ if Controls then
     end
 
 
-    function UpdateStatus()
-        if #Problems == 0 then
-            Controls.status.Value = 0
-            Controls.status.String = "OK"
-        else
-            Controls.status.Value = 2
-            Controls.status.String = "Missing: " .. table.concat(Problems, ", ")
-        end
-    end
-
-
-    -- Embedded component lookup. Missing blocks/controls are reported in status.
+    -- Missing blocks and controls are reported in the debug output.
     Blocks = {}
     for _, s in ipairs(SECTIONS) do
         Blocks[s.id] = _G[s.block]
@@ -1133,31 +1155,26 @@ if Controls then
     -- Plugin control <-> embedded control binding
     ------------------------------------------------------------
 
-    GraphDirty = false
+    GraphDirty = true
+    GraphInputs = {}
 
     function ScheduleGraph()
-        if GraphDirty or not Controls.eq_graph then return end
         GraphDirty = true
-        Timer.CallAfter(function()
-            GraphDirty = false
-            DrawGraph()
-        end, 0.05)
     end
 
 
-    -- field: "Value", "Boolean" or "String". Plugin control is the source of
-    -- truth on start; after each write the embedded value is read back so the
-    -- plugin shows any clamping the component applied.
+    -- Native writes can be asynchronous: read back on the target's change
+    -- event, not immediately after a write (which can still return its old value).
     function Bind(plugin, target, field, opts)
         opts = opts or {}
         if plugin == nil then return end
+        if opts.graph then
+            GraphInputs[#GraphInputs + 1] = { control = plugin, field = field }
+        end
 
         local function push()
             if target then
                 target[field] = plugin[field]
-                if field ~= "String" or target.String ~= "" then
-                    plugin[field] = target[field]
-                end
             end
             if opts.graph then ScheduleGraph() end
         end
@@ -1165,6 +1182,15 @@ if Controls then
         plugin.EventHandler = function()
             push()
             log(opts.name or "?", field, tostring(plugin[field]))
+        end
+
+        if target then
+            target.EventHandler = function()
+                if (field ~= "String" or target.String ~= "") and plugin[field] ~= target[field] then
+                    plugin[field] = target[field]
+                    if opts.graph then ScheduleGraph() end
+                end
+            end
         end
 
         if target and field == "String" then
@@ -1183,6 +1209,7 @@ if Controls then
 
 
     -- Gain
+    Bind(Controls.gain_bypass, BlockControl("gain", "bypass"), "Boolean", { name = "gain_bypass" })
     Bind(Controls.gain, BlockControl("gain", "gain"), "Value", { name = "gain" })
     Bind(Controls.mute, BlockControl("gain", "mute"), "Boolean", { name = "mute" })
     Bind(Controls.invert, BlockControl("gain", "invert"), "Boolean", { name = "invert" })
@@ -1268,13 +1295,20 @@ if Controls then
         if not block then
             Problem(MeterBlock(tap.id))
         else
+            local sources = {}
             for ch = 1, CHANNELS do
                 local ok, source = pcall(function() return block["meter." .. ch] end)
-                if ok and source and plugin[ch] then
-                    MeterLinks[#MeterLinks + 1] = { source, plugin[ch] }
-                elseif ch == 1 then
-                    Problem(MeterBlock(tap.id) .. ".meter.1")
+                if ok and source then
+                    sources[#sources + 1] = source
+                    if not SingleMeter(Properties) then
+                        MeterLinks[#MeterLinks + 1] = { sources = { source }, output = plugin[ch] }
+                    end
+                else
+                    Problem(MeterBlock(tap.id) .. ".meter." .. ch)
                 end
+            end
+            if SingleMeter(Properties) and #sources > 0 then
+                MeterLinks[#MeterLinks + 1] = { sources = sources, output = plugin[1] }
             end
         end
     end
@@ -1282,7 +1316,11 @@ if Controls then
     MeterTimer = Timer.New()
     MeterTimer.EventHandler = function()
         for _, link in ipairs(MeterLinks) do
-            link[2].Value = link[1].Value
+            local loudest = -math.huge
+            for _, source in ipairs(link.sources) do
+                loudest = math.max(loudest, source.Value)
+            end
+            link.output.Value = loudest
         end
         if LimiterGr then
             Controls.limiter_gr.Value = Clamp(LimiterGr.Value, GR_MIN, GR_MAX)
@@ -1295,7 +1333,7 @@ if Controls then
     -- Response graph
     ------------------------------------------------------------
 
-    GRAPH_POINTS = 240
+    GRAPH_POINTS = 96
 
     function SlopeOf(ctl, default)
         local n = ctl and tonumber((ctl.String or ""):match("(%d+)"))
@@ -1303,13 +1341,13 @@ if Controls then
     end
 
 
-    -- List of curves, each a function f -> dB, for enabled, unbypassed stages.
+    -- Snapshot all configured curves, including bypassed stages.
     function Curves()
         local curves = {}
 
         for _, side in ipairs({ "low", "high" }) do
             local mode = side == "low" and LOW_MODE or HIGH_MODE
-            if mode ~= SECTION_OFF and not Controls[side .. "_bypass"].Boolean then
+            if mode ~= SECTION_OFF then
                 local f0 = Controls[side .. "_frequency"].Value
                 local q = Controls[side .. "_q"].Value
                 local high = side == "high"
@@ -1328,13 +1366,20 @@ if Controls then
                     local ftype = Controls[side .. "_type"].String
                     curves[#curves + 1] = { color = "#7fd4ff", fn = function(f) return PassFilterDb(high, f0, slope, ftype, q, f) end }
                 end
+                curves[#curves].bypassed = Controls[side .. "_bypass"].Boolean
+                curves[#curves].id = side
+                curves[#curves].signature = table.concat({
+                    mode, f0, q, Controls[side .. "_gain"] and Controls[side .. "_gain"].Value or 0,
+                    Controls[side .. "_type"] and Controls[side .. "_type"].String or "",
+                    Controls[side .. "_slope"] and Controls[side .. "_slope"].String or ""
+                }, "|")
             end
         end
 
-        if EQ_MODE ~= EQ_OFF and not Controls.eq_bypass.Boolean then
+        if EQ_MODE ~= EQ_OFF then
             if EQ_MODE == EQ_PARAMETRIC then
                 for i = 1, EQ_BANDS do
-                    if not EqBypass[i].Boolean then
+                    do
                         local f0, gain, bw = EqFrequency[i].Value, EqGain[i].Value, EqBandwidth[i].Value
                         local t = EqType[i].String or ""
                         local c
@@ -1346,6 +1391,8 @@ if Controls then
                             c = PeakingCoefs(f0, gain, bw)
                         end
                         curves[#curves + 1] = { color = "#ffd76a", band = i, f0 = f0, gain = gain,
+                                                id = "eq" .. i, signature = table.concat({ f0, gain, bw, t }, "|"),
+                                                bypassed = Controls.eq_bypass.Boolean or EqBypass[i].Boolean,
                                                 fn = function(f) return BiquadDb(c, f) end }
                     end
                 end
@@ -1355,7 +1402,9 @@ if Controls then
                     local gain = EqGain[i].Value
                     if gain ~= 0 then
                         local c = PeakingCoefs(BandFrequency(name), gain, bw)
-                        curves[#curves + 1] = { color = "#ffd76a", fn = function(f) return BiquadDb(c, f) end, quiet = true }
+                        curves[#curves + 1] = { color = "#ffd76a", fn = function(f) return BiquadDb(c, f) end,
+                                                id = "eq" .. i, signature = tostring(gain),
+                                                bypassed = Controls.eq_bypass.Boolean }
                     end
                 end
             end
@@ -1365,97 +1414,162 @@ if Controls then
     end
 
 
-    function SvgLib()
-        local ok, lib = pcall(require, "EzSVG")
-        if ok and type(lib) == "table" and lib.Document then return lib end
-        return NewSvgWriter()
-    end
+    GraphCache = { curves = {} }
 
-    Svg = SvgLib()
-
-
-    function RenderGraph(lib, w, h)
-        local doc = lib.Document(w, h)
-        doc:add(lib.Rect(0, 0, w, h, 0, 0, { fill = "#1e2026", stroke = "none" }))
-
-        local function px(f) return GraphX(f, 0, w) end
+    function RenderGraph(lib, w, h, checkpoint)
+        checkpoint = checkpoint or function() end
+        local curves = Curves()
+        local bypassLabels = {}
+        for _, side in ipairs({ "low", "eq", "high" }) do
+            local bypass = Controls[side .. "_bypass"]
+            if bypass and bypass.Boolean then
+                bypassLabels[#bypassLabels + 1] = side:upper() .. " BYPASSED"
+            end
+        end
+        if EQ_MODE == EQ_PARAMETRIC and not Controls.eq_bypass.Boolean then
+            for i, bypass in ipairs(EqBypass) do
+                if bypass.Boolean then bypassLabels[#bypassLabels + 1] = "BAND " .. i .. " BYPASSED" end
+            end
+        end
+        local graphOrigin = EQ_MODE == EQ_GRAPHIC and GraphRect(0, Properties) or GRAPH_LEFT + 4
+        local frequencyMap = EQ_MODE == EQ_GRAPHIC and GraphicFrequencyMap(Properties)
+        local function px(f)
+            if frequencyMap then return GraphicFrequencyX(Properties, f, frequencyMap) - graphOrigin end
+            return GraphX(f, 0, w)
+        end
         local function py(db) return GraphY(db, 0, h) end
 
-        -- Grid: 1-2-5 decades bright, other multiples faint; dB every 5.
-        for _, decade in ipairs({ 10, 100, 1000, 10000 }) do
-            for m = 1, 9 do
-                local f = decade * m
-                if f >= GRAPH_FMIN and f <= GRAPH_FMAX then
-                    local strong = (m == 1 or m == 2 or m == 5)
-                    doc:add(lib.Line(px(f), 0, px(f), h, { stroke = strong and "#4a4e58" or "#30333b", stroke_width = 1 }))
+        if GraphCache.width ~= w or GraphCache.height ~= h then
+            GraphCache = { width = w, height = h, curves = {}, samples = {} }
+            local grid = lib.Document(w, h)
+            grid:add(lib.Rect(0, 0, w, h, 0, 0, { fill = "#1e2026", stroke = "none" }))
+            for _, decade in ipairs({ 10, 100, 1000, 10000 }) do
+                for m = 1, 9 do
+                    local f = decade * m
+                    if f >= GRAPH_FMIN and f <= GRAPH_FMAX then
+                        local strong = m == 1 or m == 2 or m == 5
+                        grid:add(lib.Line(px(f), 0, px(f), h,
+                            { stroke = strong and "#4a4e58" or "#30333b", stroke_width = 1 }))
+                        checkpoint()
+                    end
                 end
             end
-        end
-        for db = -GRAPH_DB, GRAPH_DB, 5 do
-            doc:add(lib.Line(0, py(db), w, py(db), { stroke = db == 0 and "#6a707c" or "#30333b", stroke_width = 1 }))
+            for db = -GRAPH_DB, GRAPH_DB, 5 do
+                grid:add(lib.Line(0, py(db), w, py(db),
+                    { stroke = db == 0 and "#6a707c" or "#30333b", stroke_width = 1 }))
+            end
+            GraphCache.grid = grid:toString():gsub("</svg>$", "")
+            local fmin = EQ_MODE == EQ_GRAPHIC and 16 or GRAPH_FMIN
+            for i = 0, GRAPH_POINTS do
+                GraphCache.samples[i] = {
+                    frequency = fmin * (GRAPH_FMAX / fmin) ^ (i / GRAPH_POINTS)
+                }
+                GraphCache.samples[i].x = px(GraphCache.samples[i].frequency)
+                checkpoint()
+            end
         end
 
-        local curves = Curves()
-        local freqs = {}
-        for i = 0, GRAPH_POINTS do
-            freqs[i] = GRAPH_FMIN * (GRAPH_FMAX / GRAPH_FMIN) ^ (i / GRAPH_POINTS)
-        end
-
-        -- Individual stages, faint.
+        local parts = { GraphCache.grid }
         for _, curve in ipairs(curves) do
-            if not curve.quiet then
-                local p = lib.Path({ stroke = curve.color, stroke_width = 1, stroke_opacity = 0.45, fill = "none" })
+            local cached = GraphCache.curves[curve.id]
+            if not cached or cached.signature ~= curve.signature then
+                cached = { signature = curve.signature, values = {} }
+                local points = {}
                 for i = 0, GRAPH_POINTS do
-                    local x, y = px(freqs[i]), py(curve.fn(freqs[i]))
-                    if i == 0 then p:moveToA(x, y) else p:lineToA(x, y) end
+                    local sample = GraphCache.samples[i]
+                    local db = curve.fn(sample.frequency)
+                    cached.values[i] = db
+                    points[#points + 1] = string.format("%s%.1f %.1f", i == 0 and "M" or "L", sample.x, py(db))
+                    checkpoint()
                 end
-                doc:add(p)
+                cached.path = table.concat(points, " ")
+                GraphCache.curves[curve.id] = cached
             end
+            curve.values = cached.values
+            parts[#parts + 1] = string.format(
+                '<path d="%s" stroke="%s" stroke-width="1" stroke-opacity="0.65" stroke-dasharray="%s" fill="none"/>',
+                cached.path, curve.color, curve.bypassed and "4 3" or "none")
         end
 
-        -- Combined response.
-        local total = lib.Path({ stroke = "#ffffff", stroke_width = 2, fill = "none" })
+        local total = {}
         for i = 0, GRAPH_POINTS do
             local db = 0
-            for _, curve in ipairs(curves) do db = db + curve.fn(freqs[i]) end
-            local x, y = px(freqs[i]), py(db)
-            if i == 0 then total:moveToA(x, y) else total:lineToA(x, y) end
+            for _, curve in ipairs(curves) do
+                if not curve.bypassed then db = db + curve.values[i] end
+            end
+            total[#total + 1] = string.format("%s%.1f %.1f", i == 0 and "M" or "L", GraphCache.samples[i].x, py(db))
+            checkpoint()
         end
-        doc:add(total)
+        parts[#parts + 1] = '<path d="' .. table.concat(total, " ")
+            .. '" stroke="#ffffff" stroke-width="2" fill="none"/>'
 
         -- Parametric band handles.
         for _, curve in ipairs(curves) do
             if curve.band then
-                doc:add(lib.Circle(px(Clamp(curve.f0, GRAPH_FMIN, GRAPH_FMAX)), py(curve.gain), 4,
-                    { fill = curve.color, stroke = "#1e2026", stroke_width = 1 }))
+                parts[#parts + 1] = lib.Circle(px(Clamp(curve.f0, GRAPH_FMIN, GRAPH_FMAX)), py(curve.gain), 4,
+                    { fill = curve.bypassed and "#1e2026" or curve.color, stroke = curve.color, stroke_width = 1 }).toString()
             end
         end
 
-        return doc:toString()
+        if #bypassLabels > 0 then
+            parts[#parts + 1] = '<text x="8" y="14" fill="#ffd76a" font-family="sans-serif" font-size="11">'
+                .. table.concat(bypassLabels, " / ") .. '</text>'
+        end
+        parts[#parts + 1] = "</svg>"
+        return table.concat(parts)
     end
 
+
+    local _, _, graphWidth, graphHeight = GraphRect(EqPage(Properties), Properties)
+
+    GraphJob = nil
+    Svg = NewSvgWriter()
 
     function DrawGraph()
         if not Controls.eq_graph then return end
-        local _, _, w, h = GraphRect(EqPage(Properties))
-
-        local ok, svg = pcall(RenderGraph, Svg, w, h)
-        if not ok then
-            log("EzSVG render failed, using built-in writer:", svg)
-            Svg = NewSvgWriter()
-            ok, svg = pcall(RenderGraph, Svg, w, h)
-        end
-        if not ok then
-            print("Output Channel Strip: graph render failed: " .. tostring(svg))
-            return
-        end
-
-        Controls.eq_graph.Legend = rapidjson.encode({ DrawChrome = false, Legend = "", IconData = Crypto.Base64Encode(svg) })
+        GraphJob = coroutine.create(function()
+            local work = 0
+            return RenderGraph(Svg, graphWidth, graphHeight, function()
+                work = work + 1
+                if work == 16 then
+                    work = 0
+                    coroutine.yield()
+                end
+            end)
+        end)
     end
 
 
-    UpdateStatus()
-    DrawGraph()
+    if Controls.eq_graph then
+        GraphTimer = Timer.New()
+        GraphTimer.EventHandler = function()
+            for _, input in ipairs(GraphInputs) do
+                local value = input.control[input.field]
+                if value ~= input.last then
+                    input.last = value
+                    GraphDirty = true
+                end
+            end
+            if GraphDirty and not GraphJob then
+                GraphDirty = false
+                DrawGraph()
+            end
+            if GraphJob then
+                local ok, result = coroutine.resume(GraphJob)
+                if not ok then
+                    GraphJob = nil
+                    Problem("graph render failed: " .. tostring(result))
+                elseif coroutine.status(GraphJob) == "dead" then
+                    GraphJob = nil
+                    Controls.eq_graph.Legend = rapidjson.encode({
+                        DrawChrome = false, Legend = "", IconData = Crypto.Base64Encode(result)
+                    })
+                    log("graph: SVG published, bytes=" .. #result)
+                end
+            end
+        end
+        GraphTimer:Start(0.005)
+    end
     log("started:", CHANNELS, "channels,", #SECTIONS, "sections,", #MeterLinks, "meter links")
 
 end
