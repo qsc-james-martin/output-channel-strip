@@ -6,7 +6,7 @@
 --   Input > Gain > Delay > Low (Shelf or High-Pass) > EQ (Parametric or Graphic)
 --         > High (Shelf or Low-Pass) > Peak Limiter > Output
 -- Low, EQ and High can be removed with properties. Delay and Limiter are always
--- available. Each stage defaults to bypass on new instances.
+-- available. Processing stages default to bypass; Gain is always active.
 -- An embedded Level Meter (True Peak/RMS, dBFS) taps the signal before the
 -- first section and after every section, so every section has a meter before
 -- and after it. Single Meter defaults to the loudest channel at each tap;
@@ -27,8 +27,8 @@
 
 PluginInfo = {
     Name = "Output Channel Strip",
-    Version = "1.0.6",
-    BuildVersion = "1.0.6",
+    Version = "1.0.11",
+    BuildVersion = "1.0.11",
     Id = "1697da51-87cc-40a5-89fe-9a795dac3853",
     Author = "James Martin",
     Description = "Output channel strip: gain, delay, low/high shelf or filter, parametric or graphic EQ, peak limiter, with meters between every section."
@@ -416,6 +416,26 @@ function GetComponents(props)
 end
 
 
+-- Native DSP pin labels differ from the plugin's external numbered pins.
+function NativeAudioPin(block, pin, count, channel)
+    local suffix = ""
+    if count == 2 then
+        suffix = channel == 1 and " Left" or " Right"
+    elseif count > 2 then
+        suffix = " Channel " .. channel
+    end
+    return block .. " " .. pin .. suffix
+end
+
+
+function MeterAudioPin(tap, count, channel)
+    -- Stereo meters omit "Input"; multi-channel meters omit "Channel".
+    if count == 2 then return MeterBlock(tap) .. (channel == 1 and " Left" or " Right") end
+    if count > 2 then return MeterBlock(tap) .. " Input " .. channel end
+    return NativeAudioPin(MeterBlock(tap), "Input", count, channel)
+end
+
+
 function GetWiring(props)
     local wiring = {}
     local n = ChannelCount(props)
@@ -426,12 +446,17 @@ function GetWiring(props)
         local tap = "in"
 
         for _, s in ipairs(sections) do
-            wiring[#wiring + 1] = { source, s.block .. " Input " .. ch, MeterBlock(tap) .. " Input " .. ch }
-            source = s.block .. " Output " .. ch
+            wiring[#wiring + 1] = {
+                source, NativeAudioPin(s.block, "Input", n, ch),
+                MeterAudioPin(tap, n, ch)
+            }
+            source = NativeAudioPin(s.block, s.id == "delay" and "Tap 1" or "Output", n, ch)
             tap = s.id
         end
 
-        wiring[#wiring + 1] = { source, ControlName("Output", n, ch), MeterBlock(tap) .. " Input " .. ch }
+        wiring[#wiring + 1] = {
+            source, ControlName("Output", n, ch), MeterAudioPin(tap, n, ch)
+        }
     end
 
     return wiring
@@ -459,7 +484,6 @@ function GetControls(props)
     end
 
     -- Gain
-    toggle("gain_bypass")
     add({ Name = "gain", ControlType = "Knob", ControlUnit = "dB", Min = minDb, Max = maxDb, DefaultValue = Clamp(0, minDb, maxDb) })
     toggle("mute")
     toggle("invert")
@@ -643,8 +667,7 @@ function GainColumn(props, layout, graphics, x, y)
     local w = 76
     local c = y + CONTENT
     AddGroup(graphics, "Gain", x, y, w, GROUP_H, SectionFill(props, "gain"))
-    layout["gain_bypass"] = ButtonEntry("Gain~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
-    layout["gain"] = FaderEntry("Gain~Gain", x + 14, c + 24, 48, 176)
+    layout["gain"] = FaderEntry("Gain~Gain", x + 14, c, 48, 200)
     layout["mute"] = ButtonEntry("Gain~Mute", "Mute", MUTE_COLOR, x + 6, c + 208, w - 12)
     layout["invert"] = ButtonEntry("Gain~Invert", "Invert", INVERT_COLOR, x + 6, c + 228, w - 12)
     return w
@@ -1209,7 +1232,8 @@ if Controls then
 
 
     -- Gain
-    Bind(Controls.gain_bypass, BlockControl("gain", "bypass"), "Boolean", { name = "gain_bypass" })
+    local gainBypass = BlockControl("gain", "bypass")
+    if gainBypass then gainBypass.Boolean = false end
     Bind(Controls.gain, BlockControl("gain", "gain"), "Value", { name = "gain" })
     Bind(Controls.mute, BlockControl("gain", "mute"), "Boolean", { name = "mute" })
     Bind(Controls.invert, BlockControl("gain", "invert"), "Boolean", { name = "invert" })
@@ -1327,6 +1351,39 @@ if Controls then
         end
     end
     MeterTimer:Start(0.05)
+
+    if DEBUG then
+        Timer.CallAfter(function()
+            print("Output Channel Strip: audio diagnostics, channels=" .. CHANNELS)
+            for _, section in ipairs(SECTIONS) do
+                local block = Blocks[section.id]
+                if block then
+                    local values = {}
+                    for _, name in ipairs({
+                        "bypass", "mute", "gain", "master.gain", "mute.1", "gain.1",
+                        "bypass.1", "input.gain", "output.gain", "detector.level"
+                    }) do
+                        local ok, control = pcall(function() return block[name] end)
+                        if ok and control then
+                            values[#values + 1] = name .. "=" .. tostring(control.Value)
+                        end
+                    end
+                    print(section.block .. ": " .. table.concat(values, ", "))
+                end
+            end
+            for _, tap in ipairs(TAPS) do
+                local block = _G[MeterBlock(tap.id)]
+                if block then
+                    local values = {}
+                    for ch = 1, CHANNELS do
+                        local ok, control = pcall(function() return block["meter." .. ch] end)
+                        if ok and control then values[#values + 1] = tostring(control.Value) end
+                    end
+                    print(MeterBlock(tap.id) .. ": " .. table.concat(values, ", "))
+                end
+            end
+        end, 20)
+    end
 
 
     ------------------------------------------------------------
