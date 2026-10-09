@@ -1,0 +1,1461 @@
+-- Output Channel Strip
+-- A complete output processing chain in one block, for dropping onto any output.
+--
+-- Signal path (embedded Q-SYS components, Mono/Stereo/Multi-Channel to match
+-- Channel Count):
+--   Input > Gain > Delay > Low (Shelf or High-Pass) > EQ (Parametric or Graphic)
+--         > High (Shelf or Low-Pass) > Peak Limiter > Output
+-- Delay, Low, EQ, High and Limiter can each be removed with properties.
+-- An embedded Level Meter (True Peak/RMS, dBFS) taps the signal before the
+-- first section and after every section, so every section has a meter before
+-- and after it.
+--
+-- Pages:
+--   Strip - every section in signal order, meters between sections.
+--   EQ    - live response graph (Low + EQ + High), full Low/EQ/High controls,
+--           meters before/after each of them. Only when one of them is enabled.
+--
+-- The response graph is drawn at runtime as an SVG (EzSVG) in a button legend.
+-- It is calculated from the control values (RBJ biquads at 48 kHz), so it is a
+-- close approximation of the native response panel, not a measurement.
+
+PluginInfo = {
+    Name = "Output Channel Strip",
+    Version = "1.0.0",
+    BuildVersion = "1.0.0",
+    Id = "1697da51-87cc-40a5-89fe-9a795dac3853",
+    Author = "James Martin",
+    Description = "Output channel strip: gain, delay, low/high shelf or filter, parametric or graphic EQ, peak limiter, with meters between every section."
+}
+
+
+------------------------------------------------------------
+-- CONSTANTS
+------------------------------------------------------------
+
+MAX_CHANNELS = 32
+
+SECTION_OFF    = "Off"
+SECTION_SHELF  = "Shelf"
+SECTION_FILTER = "Filter"
+
+EQ_PARAMETRIC = "Parametric"
+EQ_GRAPHIC    = "Graphic"
+EQ_OFF        = "Off"
+
+-- Graphic EQ band names, as used by the embedded component's control names
+-- ("<name>.gain"). Fewer bands use every 2nd/3rd/6th band of the 1/3-octave set.
+GRAPHIC_BANDS_31 = {
+    "16Hz", "20Hz", "25Hz", "31.5Hz", "40Hz", "50Hz", "63Hz", "80Hz", "100Hz", "125Hz",
+    "160Hz", "200Hz", "250Hz", "315Hz", "400Hz", "500Hz", "630Hz", "800Hz", "1kHz", "1.25kHz",
+    "1.6kHz", "2kHz", "2.5kHz", "3.15kHz", "4kHz", "5kHz", "6.3kHz", "8kHz", "10kHz", "12.5kHz",
+    "16kHz"
+}
+GRAPHIC_STEP = { ["6"] = 6, ["11"] = 3, ["16"] = 2, ["31"] = 1 }
+
+METER_MIN, METER_MAX = -60, 0
+GR_MIN, GR_MAX = -20, 0
+EQ_GAIN_RANGE = 20
+GEQ_GAIN_RANGE = 15
+
+GRAPH_FMIN, GRAPH_FMAX = 20, 20000
+GRAPH_DB = 20
+
+COMPONENT_COLOR = { 196, 160, 220 }
+GROUP_FILL      = { 228, 228, 232 }
+METER_FILL      = { 214, 214, 220 }
+LABEL_COLOR     = { 0, 0, 0 }
+BYPASS_COLOR    = { 239, 127, 162 }
+MUTE_COLOR      = { 255, 0, 0 }
+INVERT_COLOR    = { 255, 245, 123 }
+FLAT_COLOR      = { 200, 200, 200 }
+ENTRY_COLOR     = { 255, 251, 195 }
+
+
+------------------------------------------------------------
+-- PROPERTY HELPERS (design time and runtime)
+------------------------------------------------------------
+
+function Clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+
+function PropValue(props, name, default)
+    local p = props and props[name]
+    if p == nil or p.Value == nil then return default end
+    return p.Value
+end
+
+
+function PropNumber(props, name, default)
+    return tonumber(PropValue(props, name, default)) or default
+end
+
+
+function PropBool(props, name, default)
+    local v = PropValue(props, name, default)
+    return v == true or v == "Yes" or v == "true" or v == 1
+end
+
+
+function ChannelCount(props)
+    return math.floor(Clamp(PropNumber(props, "Channel Count", 2), 1, MAX_CHANNELS))
+end
+
+
+function MultiChannel(props)
+    local n = ChannelCount(props)
+    if n == 1 then return 1, 2 end
+    if n == 2 then return 2, 2 end
+    return 3, n
+end
+
+
+function GainRange(props)
+    local maxDb = Clamp(PropNumber(props, "Max Gain (dB)", 20), -99, 20)
+    local minDb = Clamp(PropNumber(props, "Min Gain (dB)", -60), -100, maxDb - 1)
+    return minDb, maxDb
+end
+
+
+function DelayEnabled(props) return PropBool(props, "Delay", true) end
+function LimiterEnabled(props) return PropBool(props, "Limiter", true) end
+function DebugEnabled(props) return PropBool(props, "Debug Print", false) end
+function LowMode(props) return PropValue(props, "Low Section", SECTION_SHELF) end
+function HighMode(props) return PropValue(props, "High Section", SECTION_SHELF) end
+function EqMode(props) return PropValue(props, "EQ Type", EQ_PARAMETRIC) end
+
+
+function MaxDelaySeconds(props)
+    return Clamp(PropNumber(props, "Max Delay (ms)", 500), 1, 2000) / 1000
+end
+
+
+function ParametricBands(props)
+    return math.floor(Clamp(PropNumber(props, "Parametric Bands", 4), 1, 16))
+end
+
+
+function GraphicBandNames(props)
+    local step = GRAPHIC_STEP[tostring(PropValue(props, "Graphic Bands", "31"))] or 1
+    local names = {}
+    for i = 1, #GRAPHIC_BANDS_31, step do
+        names[#names + 1] = GRAPHIC_BANDS_31[i]
+    end
+    return names, step
+end
+
+
+function EqBandCount(props)
+    local mode = EqMode(props)
+    if mode == EQ_PARAMETRIC then return ParametricBands(props) end
+    if mode == EQ_GRAPHIC then return #(GraphicBandNames(props)) end
+    return 0
+end
+
+
+function BandFrequency(name)
+    local num, k = name:match("^([%d%.]+)(k?)Hz$")
+    return (tonumber(num) or 1000) * (k == "k" and 1000 or 1)
+end
+
+
+function ShortBandName(name)
+    return (name:gsub("Hz$", ""))
+end
+
+
+function DefaultBandFrequency(i, n)
+    if n == 1 then return 1000 end
+    local f = 100 * (8000 / 100) ^ ((i - 1) / (n - 1))
+    return math.floor(f + 0.5)
+end
+
+
+-- Layout/pin name of one element of a control with Count = count.
+function ControlName(base, count, i)
+    if count == 1 then return base end
+    return base .. " " .. tostring(i)
+end
+
+
+------------------------------------------------------------
+-- SECTIONS AND METER TAPS
+------------------------------------------------------------
+
+-- Enabled sections in signal order: { id, label, block, type }.
+function Sections(props)
+    local list = { { id = "gain", label = "Gain", type = "gain" } }
+
+    if DelayEnabled(props) then
+        list[#list + 1] = { id = "delay", label = "Delay", type = "delay" }
+    end
+
+    local low = LowMode(props)
+    if low == SECTION_SHELF then
+        list[#list + 1] = { id = "low", label = "Low Shelf", type = "equalizer_shelving_low" }
+    elseif low == SECTION_FILTER then
+        list[#list + 1] = { id = "low", label = "High-Pass", type = "filter_highpass" }
+    end
+
+    local eq = EqMode(props)
+    if eq == EQ_PARAMETRIC then
+        list[#list + 1] = { id = "eq", label = "EQ", type = "equalizer_parametric" }
+    elseif eq == EQ_GRAPHIC then
+        list[#list + 1] = { id = "eq", label = "EQ", type = "equalizer_graphic" }
+    end
+
+    local high = HighMode(props)
+    if high == SECTION_SHELF then
+        list[#list + 1] = { id = "high", label = "High Shelf", type = "equalizer_shelving_high" }
+    elseif high == SECTION_FILTER then
+        list[#list + 1] = { id = "high", label = "Low-Pass", type = "filter_lowpass" }
+    end
+
+    if LimiterEnabled(props) then
+        list[#list + 1] = { id = "limiter", label = "Limiter", type = "limiter_peak" }
+    end
+
+    for _, s in ipairs(list) do
+        s.block = s.id .. "_block"
+    end
+
+    return list
+end
+
+
+function HasSection(props, id)
+    for _, s in ipairs(Sections(props)) do
+        if s.id == id then return true end
+    end
+    return false
+end
+
+
+-- Meter tap before the first section ("in") and after every section (its id).
+function MeterTaps(props)
+    local sections = Sections(props)
+    local taps = { { id = "in", label = "In" } }
+    for i, s in ipairs(sections) do
+        local label = ({ gain = "Gain", delay = "Delay", low = "Low", eq = "EQ", high = "High", limiter = "Limiter" })[s.id]
+        if i == #sections then label = "Out" end
+        taps[#taps + 1] = { id = s.id, label = label }
+    end
+    return taps
+end
+
+
+function MeterControl(tapId) return "meter_" .. tapId end
+function MeterBlock(tapId) return "meter_" .. tapId .. "_block" end
+
+
+-- Meter tap feeding a section (the tap just before it).
+function TapBefore(props, sectionId)
+    local prev = "in"
+    for _, s in ipairs(Sections(props)) do
+        if s.id == sectionId then return prev end
+        prev = s.id
+    end
+    return prev
+end
+
+
+function EqPageEnabled(props)
+    return HasSection(props, "low") or HasSection(props, "eq") or HasSection(props, "high")
+end
+
+
+------------------------------------------------------------
+-- APPEARANCE AND PROPERTIES
+------------------------------------------------------------
+
+function GetColor(props)
+    return COMPONENT_COLOR
+end
+
+
+function GetPrettyName(props)
+    return "Output Channel Strip  v" .. PluginInfo.Version
+end
+
+
+function GetProperties()
+    return {
+        { Name = "Channel Count", Type = "integer", Min = 1, Max = MAX_CHANNELS, Value = 2 },
+        { Name = "Max Gain (dB)", Type = "integer", Min = -99, Max = 20, Value = 20 },
+        { Name = "Min Gain (dB)", Type = "integer", Min = -100, Max = 19, Value = -60 },
+        { Name = "Delay", Type = "boolean", Value = true },
+        { Name = "Max Delay (ms)", Type = "integer", Min = 1, Max = 2000, Value = 500 },
+        { Name = "Low Section", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
+        { Name = "Low Shelf Slope", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
+        { Name = "Low Filter Max Slope", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
+        { Name = "EQ Type", Type = "enum", Choices = { EQ_PARAMETRIC, EQ_GRAPHIC, EQ_OFF }, Value = EQ_PARAMETRIC },
+        { Name = "Parametric Bands", Type = "integer", Min = 1, Max = 16, Value = 4 },
+        { Name = "Graphic Bands", Type = "enum", Choices = { "6", "11", "16", "31" }, Value = "31" },
+        { Name = "High Section", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
+        { Name = "High Shelf Slope", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
+        { Name = "High Filter Max Slope", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
+        { Name = "Limiter", Type = "boolean", Value = true },
+        { Name = "Debug Print", Type = "boolean", Value = false }
+    }
+end
+
+
+function RectifyProperties(props)
+    props["Max Delay (ms)"].IsHidden = not DelayEnabled(props)
+    props["Low Shelf Slope"].IsHidden = LowMode(props) ~= SECTION_SHELF
+    props["Low Filter Max Slope"].IsHidden = LowMode(props) ~= SECTION_FILTER
+    props["High Shelf Slope"].IsHidden = HighMode(props) ~= SECTION_SHELF
+    props["High Filter Max Slope"].IsHidden = HighMode(props) ~= SECTION_FILTER
+    props["Parametric Bands"].IsHidden = EqMode(props) ~= EQ_PARAMETRIC
+    props["Graphic Bands"].IsHidden = EqMode(props) ~= EQ_GRAPHIC
+    return props
+end
+
+
+------------------------------------------------------------
+-- PAGES
+------------------------------------------------------------
+
+function PageNames(props)
+    local names = { "Strip" }
+    if EqPageEnabled(props) then names[#names + 1] = "EQ" end
+    return names
+end
+
+
+function GetPages(props)
+    local pages = {}
+    for _, name in ipairs(PageNames(props)) do
+        pages[#pages + 1] = { name = name }
+    end
+    return pages
+end
+
+
+function CurrentPage(props)
+    return PageNames(props)[PropNumber(props, "page_index", 1)] or "Strip"
+end
+
+
+------------------------------------------------------------
+-- DSP
+------------------------------------------------------------
+
+function GetPins(props)
+    local pins = {}
+    local n = ChannelCount(props)
+    for i = 1, n do pins[#pins + 1] = { Name = ControlName("Input", n, i), Direction = "input" } end
+    for i = 1, n do pins[#pins + 1] = { Name = ControlName("Output", n, i), Direction = "output" } end
+    return pins
+end
+
+
+function SectionProperties(props, s)
+    local mcType, mcCount = MultiChannel(props)
+    local p = { ["multi_channel_type"] = mcType, ["multi_channel_count"] = mcCount }
+
+    if s.id == "gain" then
+        local minDb, maxDb = GainRange(props)
+        p["min_gain"], p["max_gain"] = minDb, maxDb
+    elseif s.id == "delay" then
+        p["n_taps"] = 1
+        p["max_delay"] = MaxDelaySeconds(props)
+        p["delay_type"] = 0
+    elseif s.id == "low" or s.id == "high" then
+        local prefix = s.id == "low" and "Low" or "High"
+        p["response_panel_enabled"] = false
+        if s.type:find("shelving") then
+            p["filter_slope"] = PropValue(props, prefix .. " Shelf Slope", "12dB/Oct") == "6dB/Oct" and 6 or 12
+        else
+            p["max_slope"] = tonumber(PropValue(props, prefix .. " Filter Max Slope", "48")) or 48
+        end
+    elseif s.id == "eq" then
+        p["response_panel_enabled"] = false
+        p["n_bands"] = EqBandCount(props)
+        if s.type == "equalizer_parametric" then
+            p["bandwidth_q_factor"] = 0
+        end
+    end
+
+    return p
+end
+
+
+function GetComponents(props)
+    local components = {}
+    local mcType, mcCount = MultiChannel(props)
+
+    for _, s in ipairs(Sections(props)) do
+        components[#components + 1] = { Name = s.block, Type = s.type, Properties = SectionProperties(props, s) }
+    end
+
+    for _, tap in ipairs(MeterTaps(props)) do
+        components[#components + 1] = {
+            Name = MeterBlock(tap.id),
+            Type = "meter2",
+            Properties = { ["meter_type"] = 1, ["multi_channel_type"] = mcType, ["multi_channel_count"] = mcCount }
+        }
+    end
+
+    return components
+end
+
+
+function GetWiring(props)
+    local wiring = {}
+    local n = ChannelCount(props)
+    local sections = Sections(props)
+
+    for ch = 1, n do
+        local source = ControlName("Input", n, ch)
+        local tap = "in"
+
+        for _, s in ipairs(sections) do
+            wiring[#wiring + 1] = { source, s.block .. " Input " .. ch, MeterBlock(tap) .. " Input " .. ch }
+            source = s.block .. " Output " .. ch
+            tap = s.id
+        end
+
+        wiring[#wiring + 1] = { source, ControlName("Output", n, ch), MeterBlock(tap) .. " Input " .. ch }
+    end
+
+    return wiring
+end
+
+
+------------------------------------------------------------
+-- CONTROLS
+------------------------------------------------------------
+
+function GetControls(props)
+    local controls = {}
+    local minDb, maxDb = GainRange(props)
+
+    local function add(t)
+        t.Count = t.Count or 1
+        if t.PinStyle == nil then t.PinStyle = "Both" end
+        if t.UserPin == nil then t.UserPin = true end
+        controls[#controls + 1] = t
+    end
+
+    local function toggle(name) add({ Name = name, ControlType = "Button", ButtonType = "Toggle" }) end
+
+    -- Gain
+    add({ Name = "gain", ControlType = "Knob", ControlUnit = "dB", Min = minDb, Max = maxDb, DefaultValue = Clamp(0, minDb, maxDb) })
+    toggle("mute")
+    toggle("invert")
+
+    if DelayEnabled(props) then
+        toggle("delay_bypass")
+        add({ Name = "delay", ControlType = "Knob", ControlUnit = "Seconds", Min = 0, Max = MaxDelaySeconds(props), DefaultValue = 0 })
+    end
+
+    for _, side in ipairs({ "low", "high" }) do
+        local mode = side == "low" and LowMode(props) or HighMode(props)
+        if mode ~= SECTION_OFF then
+            local defaultHz
+            if mode == SECTION_SHELF then
+                defaultHz = side == "low" and 100 or 8000
+            else
+                defaultHz = side == "low" and 80 or 16000
+            end
+
+            toggle(side .. "_bypass")
+            add({ Name = side .. "_frequency", ControlType = "Knob", ControlUnit = "Hz", Min = 20, Max = 20000, DefaultValue = defaultHz })
+            add({ Name = side .. "_q", ControlType = "Knob", ControlUnit = "Float", Min = 0.1, Max = 10, DefaultValue = 0.707 })
+
+            if mode == SECTION_SHELF then
+                add({ Name = side .. "_gain", ControlType = "Knob", ControlUnit = "dB", Min = -EQ_GAIN_RANGE, Max = EQ_GAIN_RANGE, DefaultValue = 0 })
+            else
+                add({ Name = side .. "_type", ControlType = "Text" })
+                add({ Name = side .. "_slope", ControlType = "Text" })
+            end
+        end
+    end
+
+    local eq = EqMode(props)
+    if eq ~= EQ_OFF then
+        local n = EqBandCount(props)
+        toggle("eq_bypass")
+        add({ Name = "eq_flat", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input" })
+
+        if eq == EQ_PARAMETRIC then
+            add({ Name = "eq_band_bypass", ControlType = "Button", ButtonType = "Toggle", Count = n })
+            add({ Name = "eq_gain", ControlType = "Knob", ControlUnit = "dB", Min = -EQ_GAIN_RANGE, Max = EQ_GAIN_RANGE, DefaultValue = 0, Count = n })
+            add({ Name = "eq_bandwidth", ControlType = "Knob", ControlUnit = "Float", Min = 0.03, Max = 4, DefaultValue = 1, Count = n })
+            add({ Name = "eq_type", ControlType = "Text", Count = n })
+            -- Per-band default frequencies need one control per band.
+            for i = 1, n do
+                add({ Name = n == 1 and "eq_frequency" or ("eq_frequency_" .. i), ControlType = "Knob", ControlUnit = "Hz",
+                      Min = 20, Max = 20000, DefaultValue = DefaultBandFrequency(i, n) })
+            end
+        else
+            add({ Name = "eq_gain", ControlType = "Knob", ControlUnit = "dB", Min = -GEQ_GAIN_RANGE, Max = GEQ_GAIN_RANGE, DefaultValue = 0, Count = n })
+        end
+    end
+
+    if LimiterEnabled(props) then
+        toggle("limiter_bypass")
+        add({ Name = "limiter_threshold", ControlType = "Knob", ControlUnit = "dB", Min = -60, Max = 20, DefaultValue = 0 })
+        add({ Name = "limiter_attack", ControlType = "Knob", ControlUnit = "Seconds", Min = 0.0001, Max = 0.1, DefaultValue = 0.01 })
+        add({ Name = "limiter_release", ControlType = "Knob", ControlUnit = "Seconds", Min = 0.001, Max = 5, DefaultValue = 0.1 })
+        add({ Name = "limiter_gr", ControlType = "Indicator", IndicatorType = "Meter", Min = GR_MIN, Max = GR_MAX, PinStyle = "Output" })
+    end
+
+    local channels = ChannelCount(props)
+    for _, tap in ipairs(MeterTaps(props)) do
+        add({ Name = MeterControl(tap.id), ControlType = "Indicator", IndicatorType = "Meter",
+              Min = METER_MIN, Max = METER_MAX, Count = channels, PinStyle = "Output" })
+    end
+
+    if EqPageEnabled(props) then
+        add({ Name = "eq_graph", ControlType = "Button", ButtonType = "Trigger", PinStyle = "None", UserPin = false })
+    end
+
+    add({ Name = "status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output" })
+
+    return controls
+end
+
+
+-- Name of the frequency control for parametric band i.
+function EqFrequencyName(n, i)
+    if n == 1 then return "eq_frequency" end
+    return "eq_frequency_" .. i
+end
+
+
+------------------------------------------------------------
+-- LAYOUT
+------------------------------------------------------------
+
+TOP = 4
+GROUP_H = 272
+CONTENT = 20         -- group content starts this far below the group top
+GAP = 4              -- between groups
+METER_TOP = 24       -- meter area relative to group top
+METER_H = 232
+STATUS_H = 16
+
+
+function AddGroup(graphics, text, x, y, w, h, fill)
+    table.insert(graphics, {
+        Type = "GroupBox", Text = text, HTextAlign = "Left", FontSize = 11,
+        Color = LABEL_COLOR, Fill = fill or GROUP_FILL, StrokeColor = { 160, 160, 170 }, StrokeWidth = 1,
+        CornerRadius = 6, Position = { x, y }, Size = { w, h }
+    })
+end
+
+
+function AddLabel(graphics, text, x, y, w, h, align)
+    table.insert(graphics, {
+        Type = "Label", Text = text, HTextAlign = align or "Center", FontSize = 11,
+        Color = LABEL_COLOR, Position = { x, y }, Size = { w, h or 16 }
+    })
+end
+
+
+function ButtonEntry(pretty, legend, color, x, y, w)
+    return { PrettyName = pretty, Style = "Button", Legend = legend, FontSize = 9, Color = color,
+             Position = { x, y }, Size = { w, 16 } }
+end
+
+
+function TextEntry(pretty, x, y, w)
+    return { PrettyName = pretty, Style = "Text", FontSize = 11, Color = ENTRY_COLOR,
+             Position = { x, y }, Size = { w, 16 } }
+end
+
+
+function ComboEntry(pretty, x, y, w)
+    return { PrettyName = pretty, Style = "ComboBox", FontSize = 11, Position = { x, y }, Size = { w, 16 } }
+end
+
+
+function FaderEntry(pretty, x, y, w, h)
+    return { PrettyName = pretty, Style = "Fader", ShowTextbox = true, FontSize = 11,
+             Position = { x, y }, Size = { w, h } }
+end
+
+
+function MeterEntry(pretty, x, y, w, h, style)
+    return { PrettyName = pretty, Style = "Meter", MeterStyle = style or "Level", ShowTextbox = false,
+             Position = { x, y }, Size = { w, h } }
+end
+
+
+-- Per-channel meter width and gap for a channel count.
+function MeterGeometry(channels)
+    local w = channels <= 2 and 10 or channels <= 4 and 8 or channels <= 8 and 5 or 3
+    local gap = channels <= 2 and 2 or 1
+    return w, gap, channels * w + (channels - 1) * gap
+end
+
+
+function MeterColumnWidth(props)
+    local _, _, total = MeterGeometry(ChannelCount(props))
+    return math.max(40, total + 12)
+end
+
+
+-- Column of per-channel meters for one tap. Returns its width.
+function MeterColumn(props, layout, graphics, tap, label, x, y)
+    local n = ChannelCount(props)
+    local w, gap, total = MeterGeometry(n)
+    local colW = MeterColumnWidth(props)
+
+    AddGroup(graphics, label, x, y, colW, GROUP_H, METER_FILL)
+
+    local mx = x + math.floor((colW - total) / 2)
+    for ch = 1, n do
+        layout[ControlName(MeterControl(tap), n, ch)] = MeterEntry(
+            "Meters~" .. label .. "~Channel " .. ch, mx + (ch - 1) * (w + gap), y + METER_TOP, w, METER_H)
+    end
+
+    return colW
+end
+
+
+-- dB scale beside the first meter column on the Strip page.
+function ScaleColumn(graphics, x, y)
+    local w = 36
+    AddGroup(graphics, "dB", x, y, w, GROUP_H, METER_FILL)
+    for db = METER_MAX, METER_MIN, -10 do
+        local py = y + METER_TOP + math.floor((METER_MAX - db) / (METER_MAX - METER_MIN) * METER_H + 0.5)
+        AddLabel(graphics, tostring(db), x + 2, Clamp(py - 8, y + METER_TOP, y + METER_TOP + METER_H - 16), w - 6, 16, "Right")
+    end
+    return w
+end
+
+
+function GainColumn(props, layout, graphics, x, y)
+    local w = 76
+    local c = y + CONTENT
+    AddGroup(graphics, "Gain", x, y, w, GROUP_H)
+    layout["gain"] = FaderEntry("Gain~Gain", x + 14, c, 48, 200)
+    layout["mute"] = ButtonEntry("Gain~Mute", "Mute", MUTE_COLOR, x + 6, c + 208, w - 12)
+    layout["invert"] = ButtonEntry("Gain~Invert", "Invert", INVERT_COLOR, x + 6, c + 228, w - 12)
+    return w
+end
+
+
+function DelayColumn(props, layout, graphics, x, y)
+    local w = 76
+    local c = y + CONTENT
+    AddGroup(graphics, "Delay", x, y, w, GROUP_H)
+    layout["delay_bypass"] = ButtonEntry("Delay~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
+    AddLabel(graphics, "Time", x + 6, c + 24, w - 12)
+    layout["delay"] = TextEntry("Delay~Delay", x + 6, c + 44, w - 12)
+    return w
+end
+
+
+-- Low or High shelf/filter column (same on both pages).
+function ShelfFilterColumn(props, layout, graphics, side, x, y)
+    local mode = side == "low" and LowMode(props) or HighMode(props)
+    local title
+    if mode == SECTION_SHELF then
+        title = side == "low" and "Low Shelf" or "High Shelf"
+    else
+        title = side == "low" and "High-Pass" or "Low-Pass"
+    end
+
+    local w = 92
+    local c = y + CONTENT
+    local inner = w - 12
+    AddGroup(graphics, title, x, y, w, GROUP_H)
+
+    layout[side .. "_bypass"] = ButtonEntry(title .. "~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, inner)
+
+    if mode == SECTION_SHELF then
+        layout[side .. "_gain"] = FaderEntry(title .. "~Gain", x + 22, c + 24, 48, 136)
+        AddLabel(graphics, "Freq", x + 6, c + 168, inner)
+        layout[side .. "_frequency"] = TextEntry(title .. "~Frequency", x + 6, c + 188, inner)
+        AddLabel(graphics, "Q", x + 6, c + 208, 16)
+        layout[side .. "_q"] = TextEntry(title .. "~Q", x + 26, c + 208, inner - 20)
+    else
+        AddLabel(graphics, "Freq", x + 6, c + 24, inner)
+        layout[side .. "_frequency"] = TextEntry(title .. "~Frequency", x + 6, c + 44, inner)
+        AddLabel(graphics, "Type", x + 6, c + 68, inner)
+        layout[side .. "_type"] = ComboEntry(title .. "~Type", x + 6, c + 88, inner)
+        AddLabel(graphics, "Slope", x + 6, c + 112, inner)
+        layout[side .. "_slope"] = ComboEntry(title .. "~Slope", x + 6, c + 132, inner)
+        AddLabel(graphics, "Q", x + 6, c + 156, inner)
+        layout[side .. "_q"] = TextEntry(title .. "~Q (Variable-Q only)", x + 6, c + 176, inner)
+    end
+
+    return w
+end
+
+
+-- Compact EQ block for the Strip page: bypass and flat only.
+function EqSummaryColumn(props, layout, graphics, x, y)
+    local w = 76
+    local c = y + CONTENT
+    AddGroup(graphics, "EQ", x, y, w, GROUP_H)
+    layout["eq_bypass"] = ButtonEntry("EQ~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
+    layout["eq_flat"] = ButtonEntry("EQ~Flat", "Flat", FLAT_COLOR, x + 6, c + 20, w - 12)
+    AddLabel(graphics, EqMode(props), x + 6, c + 44, w - 12)
+    AddLabel(graphics, tostring(EqBandCount(props)) .. " bands", x + 6, c + 64, w - 12)
+    AddLabel(graphics, "(EQ page)", x + 6, c + 84, w - 12)
+    return w
+end
+
+
+function LimiterColumn(props, layout, graphics, x, y)
+    local w = 108
+    local c = y + CONTENT
+    AddGroup(graphics, "Limiter", x, y, w, GROUP_H)
+    layout["limiter_bypass"] = ButtonEntry("Limiter~Bypass", "Bypass", BYPASS_COLOR, x + 6, c, w - 12)
+    AddLabel(graphics, "Thresh", x + 6, c + 24, 56)
+    AddLabel(graphics, "GR", x + 70, c + 24, 32)
+    layout["limiter_threshold"] = FaderEntry("Limiter~Threshold", x + 10, c + 44, 48, 156)
+    layout["limiter_gr"] = MeterEntry("Limiter~Gain Reduction", x + 78, c + 44, 16, 140, "Reduction")
+    AddLabel(graphics, "Attack", x + 6, c + 208, 44, 16, "Left")
+    layout["limiter_attack"] = TextEntry("Limiter~Attack", x + 52, c + 208, w - 58)
+    AddLabel(graphics, "Release", x + 6, c + 228, 44, 16, "Left")
+    layout["limiter_release"] = TextEntry("Limiter~Release", x + 52, c + 228, w - 58)
+    return w
+end
+
+
+function ParametricColumns(props, layout, graphics, x, y)
+    local n = ParametricBands(props)
+    local labelW, bandW = 44, 56
+    local w = labelW + n * bandW + 8
+    local c = y + CONTENT
+
+    AddGroup(graphics, "Parametric EQ", x, y, w, GROUP_H)
+    layout["eq_bypass"] = ButtonEntry("EQ~Bypass", "Bypass", BYPASS_COLOR, x + w - 108, y + 2, 50)
+    layout["eq_flat"] = ButtonEntry("EQ~Flat", "Flat", FLAT_COLOR, x + w - 56, y + 2, 50)
+
+    AddLabel(graphics, "Bypass", x + 4, c + 20, labelW - 4, 16, "Left")
+    AddLabel(graphics, "Gain", x + 4, c + 40, labelW - 4, 16, "Left")
+    AddLabel(graphics, "Freq", x + 4, c + 184, labelW - 4, 16, "Left")
+    AddLabel(graphics, "BW", x + 4, c + 204, labelW - 4, 16, "Left")
+    AddLabel(graphics, "Type", x + 4, c + 224, labelW - 4, 16, "Left")
+
+    for i = 1, n do
+        local bx = x + labelW + (i - 1) * bandW
+        local band = "EQ~Band " .. i .. "~"
+        AddLabel(graphics, tostring(i), bx + 4, c, bandW - 8)
+        layout[ControlName("eq_band_bypass", n, i)] = ButtonEntry(band .. "Bypass", "Byp", BYPASS_COLOR, bx + 4, c + 20, bandW - 8)
+        layout[ControlName("eq_gain", n, i)] = FaderEntry(band .. "Gain", bx + 4, c + 40, bandW - 8, 140)
+        layout[EqFrequencyName(n, i)] = TextEntry(band .. "Frequency", bx + 4, c + 184, bandW - 8)
+        layout[ControlName("eq_bandwidth", n, i)] = TextEntry(band .. "Bandwidth", bx + 4, c + 204, bandW - 8)
+        layout[ControlName("eq_type", n, i)] = ComboEntry(band .. "Type", bx + 4, c + 224, bandW - 8)
+    end
+
+    return w
+end
+
+
+function GraphicColumns(props, layout, graphics, x, y)
+    local names = GraphicBandNames(props)
+    local n = #names
+    local bandW = 24
+    local w = math.max(120, n * bandW + 16)
+    local c = y + CONTENT
+    local x0 = x + math.floor((w - n * bandW) / 2)
+
+    AddGroup(graphics, "Graphic EQ", x, y, w, GROUP_H)
+    layout["eq_bypass"] = ButtonEntry("EQ~Bypass", "Bypass", BYPASS_COLOR, x + w - 108, y + 2, 50)
+    layout["eq_flat"] = ButtonEntry("EQ~Flat", "Flat", FLAT_COLOR, x + w - 56, y + 2, 50)
+
+    for i, name in ipairs(names) do
+        local bx = x0 + (i - 1) * bandW
+        layout[ControlName("eq_gain", n, i)] = {
+            PrettyName = "EQ~" .. name .. " Gain", Style = "Fader", ShowTextbox = false,
+            Position = { bx + 2, c }, Size = { bandW - 4, 204 }
+        }
+        -- Alternate label rows so wide labels never collide.
+        local row = (n > 11) and ((i - 1) % 2) or 0
+        local lw = (n > 11) and (bandW * 2 - 4) or (bandW + 8)
+        AddLabel(graphics, ShortBandName(name), bx + math.floor((bandW - lw) / 2), c + 208 + row * 16, lw)
+    end
+
+    return w
+end
+
+
+-- Graph geometry for a given row width (shared by layout and runtime).
+GRAPH_LEFT = 36      -- room for dB labels
+GRAPH_H = 156
+
+
+function GraphRect(rowW)
+    return GRAPH_LEFT + 4, TOP + CONTENT, math.max(300, rowW - GRAPH_LEFT - 8), GRAPH_H
+end
+
+
+function GraphX(f, gx, gw)
+    local t = (math.log(f, 10) - math.log(GRAPH_FMIN, 10)) / (math.log(GRAPH_FMAX, 10) - math.log(GRAPH_FMIN, 10))
+    return gx + t * gw
+end
+
+
+function GraphY(db, gy, gh)
+    return gy + (GRAPH_DB - Clamp(db, -GRAPH_DB, GRAPH_DB)) / (2 * GRAPH_DB) * gh
+end
+
+
+-- Builds the EQ page (or just measures it with layout = nil). Returns row width.
+function EqPage(props, layout, graphics)
+    layout = layout or {}
+    graphics = graphics or {}
+
+    local rowY = TOP + CONTENT + GRAPH_H + 24 + GAP
+    local x = 4
+    local taps = {}
+
+    local function meters(tap, label)
+        x = x + MeterColumn(props, layout, graphics, tap, label, x, rowY) + GAP
+    end
+
+    local first = HasSection(props, "low") and "low" or HasSection(props, "eq") and "eq" or "high"
+    meters(TapBefore(props, first), "Pre")
+
+    if HasSection(props, "low") then
+        x = x + ShelfFilterColumn(props, layout, graphics, "low", x, rowY) + GAP
+        meters("low", "Low")
+    end
+
+    if HasSection(props, "eq") then
+        if EqMode(props) == EQ_PARAMETRIC then
+            x = x + ParametricColumns(props, layout, graphics, x, rowY) + GAP
+        else
+            x = x + GraphicColumns(props, layout, graphics, x, rowY) + GAP
+        end
+        meters("eq", "EQ")
+    end
+
+    if HasSection(props, "high") then
+        x = x + ShelfFilterColumn(props, layout, graphics, "high", x, rowY) + GAP
+        meters("high", "High")
+    end
+
+    local rowW = math.max(x - GAP, 360)
+
+    -- Response graph across the full row width.
+    local gx, gy, gw, gh = GraphRect(rowW)
+    table.insert(graphics, 1, {
+        Type = "GroupBox", Text = "Response (approx.)", HTextAlign = "Left", FontSize = 11,
+        Color = LABEL_COLOR, Fill = GROUP_FILL, StrokeColor = { 160, 160, 170 }, StrokeWidth = 1,
+        CornerRadius = 6, Position = { 4, TOP }, Size = { rowW - 4, GRAPH_H + 44 }
+    })
+
+    for db = GRAPH_DB, -GRAPH_DB, -10 do
+        local py = math.floor(GraphY(db, gy, gh) + 0.5)
+        AddLabel(graphics, (db > 0 and "+" or "") .. db, 6, Clamp(py - 8, gy, gy + gh - 16), GRAPH_LEFT - 6, 16, "Right")
+    end
+
+    for _, f in ipairs({ 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000 }) do
+        local px = math.floor(GraphX(f, gx, gw) + 0.5)
+        local text = f >= 1000 and (tostring(f // 1000) .. "k") or tostring(f)
+        AddLabel(graphics, text, Clamp(px - 15, gx, gx + gw - 30), gy + gh + 2, 30)
+    end
+
+    layout["eq_graph"] = {
+        PrettyName = "EQ~Response Graph", Style = "Button", ButtonStyle = "Trigger", ButtonVisualStyle = "Flat",
+        Color = { 30, 32, 38 }, IsReadOnly = true, Position = { gx, gy }, Size = { gw, gh }
+    }
+
+    layout["status"] = {
+        PrettyName = "Status", Style = "Text", FontSize = 11, IsReadOnly = true,
+        Position = { 4, rowY + GROUP_H + GAP }, Size = { rowW - 4, STATUS_H }
+    }
+
+    return rowW
+end
+
+
+function StripPage(props, layout, graphics)
+    local x, y = 4, TOP
+    local taps = MeterTaps(props)
+    local tapIndex = 1
+
+    local function meters()
+        local tap = taps[tapIndex]
+        x = x + MeterColumn(props, layout, graphics, tap.id, tap.label, x, y) + GAP
+        tapIndex = tapIndex + 1
+    end
+
+    x = x + ScaleColumn(graphics, x, y) + GAP
+    meters()
+
+    for _, s in ipairs(Sections(props)) do
+        if s.id == "gain" then
+            x = x + GainColumn(props, layout, graphics, x, y) + GAP
+        elseif s.id == "delay" then
+            x = x + DelayColumn(props, layout, graphics, x, y) + GAP
+        elseif s.id == "low" or s.id == "high" then
+            x = x + ShelfFilterColumn(props, layout, graphics, s.id, x, y) + GAP
+        elseif s.id == "eq" then
+            x = x + EqSummaryColumn(props, layout, graphics, x, y) + GAP
+        elseif s.id == "limiter" then
+            x = x + LimiterColumn(props, layout, graphics, x, y) + GAP
+        end
+        meters()
+    end
+
+    layout["status"] = {
+        PrettyName = "Status", Style = "Text", FontSize = 11, IsReadOnly = true,
+        Position = { 4, y + GROUP_H + GAP }, Size = { x - GAP - 4, STATUS_H }
+    }
+end
+
+
+function GetControlLayout(props)
+    local layout, graphics = {}, {}
+
+    if CurrentPage(props) == "EQ" then
+        EqPage(props, layout, graphics)
+    else
+        StripPage(props, layout, graphics)
+    end
+
+    return layout, graphics
+end
+
+
+------------------------------------------------------------
+-- RESPONSE MATHS (runtime graph; pure functions)
+------------------------------------------------------------
+
+FS = 48000
+
+
+function BiquadDb(c, f)
+    local w = 2 * math.pi * f / FS
+    local cw, sw, c2, s2 = math.cos(w), math.sin(w), math.cos(2 * w), math.sin(2 * w)
+    local nr = c[1] + c[2] * cw + c[3] * c2
+    local ni = -(c[2] * sw + c[3] * s2)
+    local dr = c[4] + c[5] * cw + c[6] * c2
+    local di = -(c[5] * sw + c[6] * s2)
+    local num, den = nr * nr + ni * ni, dr * dr + di * di
+    if num <= 0 or den <= 0 then return -120 end
+    return 10 * math.log(num / den, 10)
+end
+
+
+function SafeF0(f0)
+    return Clamp(f0, 5, FS * 0.45)
+end
+
+
+function PeakingCoefs(f0, gainDb, bwOct)
+    local A = 10 ^ (gainDb / 40)
+    local w0 = 2 * math.pi * SafeF0(f0) / FS
+    local sn, cs = math.sin(w0), math.cos(w0)
+    local x = math.log(2) / 2 * Clamp(bwOct, 0.01, 8) * w0 / sn
+    local alpha = sn * (math.exp(x) - math.exp(-x)) / 2   -- sinh (not in Lua 5.3)
+    return { 1 + alpha * A, -2 * cs, 1 - alpha * A, 1 + alpha / A, -2 * cs, 1 - alpha / A }
+end
+
+
+function ShelfCoefs(high, f0, gainDb, q)
+    local A = 10 ^ (gainDb / 40)
+    local w0 = 2 * math.pi * SafeF0(f0) / FS
+    local sn, cs = math.sin(w0), math.cos(w0)
+    local alpha = sn / (2 * Clamp(q, 0.1, 10))
+    local s = 2 * math.sqrt(A) * alpha
+    if high then
+        return { A * ((A + 1) + (A - 1) * cs + s), -2 * A * ((A - 1) + (A + 1) * cs), A * ((A + 1) + (A - 1) * cs - s),
+                 (A + 1) - (A - 1) * cs + s, 2 * ((A - 1) - (A + 1) * cs), (A + 1) - (A - 1) * cs - s }
+    end
+    return { A * ((A + 1) - (A - 1) * cs + s), 2 * A * ((A - 1) - (A + 1) * cs), A * ((A + 1) - (A - 1) * cs - s),
+             (A + 1) + (A - 1) * cs + s, -2 * ((A - 1) + (A + 1) * cs), (A + 1) + (A - 1) * cs - s }
+end
+
+
+-- First-order (6 dB/oct) shelf, analog approximation.
+function FirstOrderShelfDb(high, f0, gainDb, f)
+    local g2 = 10 ^ (gainDb / 10)
+    local r2 = (f / f0) ^ 2
+    if high then
+        return 10 * math.log((g2 * r2 + 1) / (r2 + 1), 10)
+    end
+    return 10 * math.log((r2 + g2) / (r2 + 1), 10)
+end
+
+
+-- High-pass (high = false) or low-pass (high = true) magnitude in dB.
+function PassFilterDb(lowpass, f0, slopeDb, filterType, q, f)
+    local order = math.max(1, math.floor((slopeDb or 12) / 6 + 0.5))
+    local ratio = lowpass and (f / f0) or (f0 / f)
+    filterType = filterType or ""
+
+    if filterType:find("Variable") then
+        local w0 = 2 * math.pi * SafeF0(f0) / FS
+        local sn, cs = math.sin(w0), math.cos(w0)
+        local alpha = sn / (2 * Clamp(q or 0.707, 0.1, 10))
+        local c
+        if lowpass then
+            c = { (1 - cs) / 2, 1 - cs, (1 - cs) / 2, 1 + alpha, -2 * cs, 1 - alpha }
+        else
+            c = { (1 + cs) / 2, -(1 + cs), (1 + cs) / 2, 1 + alpha, -2 * cs, 1 - alpha }
+        end
+        return BiquadDb(c, f) * (order / 2)
+    end
+
+    if filterType:find("Linkwitz") then
+        return -20 * math.log(1 + ratio ^ order, 10)
+    end
+
+    return -10 * math.log(1 + ratio ^ (2 * order), 10)
+end
+
+
+------------------------------------------------------------
+-- MINIMAL SVG WRITER (used when EzSVG is not available)
+------------------------------------------------------------
+
+function NewSvgWriter()
+    local W = {}
+    local function attrs(style)
+        local out = {}
+        for k, v in pairs(style or {}) do
+            out[#out + 1] = string.format('%s="%s"', (k:gsub("_", "-")), tostring(v))
+        end
+        table.sort(out)
+        return table.concat(out, " ")
+    end
+    local function element(text) return { toString = function() return text end } end
+
+    function W.Document(w, h)
+        local doc = { items = {} }
+        function doc:add(e) self.items[#self.items + 1] = e end
+        function doc:toString()
+            local parts = { string.format('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">', w, h, w, h) }
+            for _, e in ipairs(self.items) do parts[#parts + 1] = e.toString() end
+            parts[#parts + 1] = "</svg>"
+            return table.concat(parts)
+        end
+        return doc
+    end
+    function W.Rect(x, y, w, h, rx, ry, style)
+        return element(string.format('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" %s/>', x, y, w, h, attrs(style)))
+    end
+    function W.Line(x1, y1, x2, y2, style)
+        return element(string.format('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" %s/>', x1, y1, x2, y2, attrs(style)))
+    end
+    function W.Circle(cx, cy, r, style)
+        return element(string.format('<circle cx="%.1f" cy="%.1f" r="%.1f" %s/>', cx, cy, r, attrs(style)))
+    end
+    function W.Path(style)
+        local p = { d = {} }
+        function p:moveToA(x, y) self.d[#self.d + 1] = string.format("M%.1f %.1f", x, y) end
+        function p:lineToA(x, y) self.d[#self.d + 1] = string.format("L%.1f %.1f", x, y) end
+        function p.toString() return string.format('<path d="%s" %s/>', table.concat(p.d, " "), attrs(style)) end
+        return p
+    end
+    return W
+end
+
+
+------------------------------------------------------------
+-- RUNTIME
+------------------------------------------------------------
+
+if Controls then
+
+    rapidjson = require("rapidjson")
+
+    DEBUG = DebugEnabled(Properties)
+    CHANNELS = ChannelCount(Properties)
+    SECTIONS = Sections(Properties)
+    TAPS = MeterTaps(Properties)
+    EQ_MODE = HasSection(Properties, "eq") and EqMode(Properties) or EQ_OFF
+    EQ_BANDS = EqBandCount(Properties)
+    GRAPHIC_NAMES, GRAPHIC_STEP_N = GraphicBandNames(Properties)
+    LOW_MODE = HasSection(Properties, "low") and LowMode(Properties) or SECTION_OFF
+    HIGH_MODE = HasSection(Properties, "high") and HighMode(Properties) or SECTION_OFF
+
+    Problems = {}
+
+
+    function log(...)
+        if DEBUG then print("[Output Strip]", ...) end
+    end
+
+
+    function arr(c)
+        if c == nil then return {} end
+        local ok, first = pcall(function() return c[1] end)
+        if ok and first ~= nil then return c end
+        return { c }
+    end
+
+
+    function Problem(text)
+        Problems[#Problems + 1] = text
+        print("Output Channel Strip: " .. text)
+    end
+
+
+    function UpdateStatus()
+        if #Problems == 0 then
+            Controls.status.Value = 0
+            Controls.status.String = "OK"
+        else
+            Controls.status.Value = 2
+            Controls.status.String = "Missing: " .. table.concat(Problems, ", ")
+        end
+    end
+
+
+    -- Embedded component lookup. Missing blocks/controls are reported in status.
+    Blocks = {}
+    for _, s in ipairs(SECTIONS) do
+        Blocks[s.id] = _G[s.block]
+        if not Blocks[s.id] then Problem(s.block) end
+    end
+
+
+    function BlockControl(sectionId, names)
+        local block = Blocks[sectionId]
+        if not block then return nil end
+        if type(names) == "string" then names = { names } end
+        for _, name in ipairs(names) do
+            local ok, ctl = pcall(function() return block[name] end)
+            if ok and ctl ~= nil then return ctl end
+        end
+        Problem(sectionId .. "." .. names[1])
+        return nil
+    end
+
+
+    ------------------------------------------------------------
+    -- Plugin control <-> embedded control binding
+    ------------------------------------------------------------
+
+    GraphDirty = false
+
+    function ScheduleGraph()
+        if GraphDirty or not Controls.eq_graph then return end
+        GraphDirty = true
+        Timer.CallAfter(function()
+            GraphDirty = false
+            DrawGraph()
+        end, 0.05)
+    end
+
+
+    -- field: "Value", "Boolean" or "String". Plugin control is the source of
+    -- truth on start; after each write the embedded value is read back so the
+    -- plugin shows any clamping the component applied.
+    function Bind(plugin, target, field, opts)
+        opts = opts or {}
+        if plugin == nil then return end
+
+        local function push()
+            if target then
+                target[field] = plugin[field]
+                if field ~= "String" or target.String ~= "" then
+                    plugin[field] = target[field]
+                end
+            end
+            if opts.graph then ScheduleGraph() end
+        end
+
+        plugin.EventHandler = function()
+            push()
+            log(opts.name or "?", field, tostring(plugin[field]))
+        end
+
+        if target and field == "String" then
+            local okChoices, choices = pcall(function() return target.Choices end)
+            if okChoices and type(choices) == "table" and #choices > 0 then
+                plugin.Choices = choices
+            end
+            if plugin.String == "" then
+                plugin.String = target.String
+                return
+            end
+        end
+
+        push()
+    end
+
+
+    -- Gain
+    Bind(Controls.gain, BlockControl("gain", "gain"), "Value", { name = "gain" })
+    Bind(Controls.mute, BlockControl("gain", "mute"), "Boolean", { name = "mute" })
+    Bind(Controls.invert, BlockControl("gain", "invert"), "Boolean", { name = "invert" })
+
+    -- Delay
+    if HasSection(Properties, "delay") then
+        Bind(Controls.delay_bypass, BlockControl("delay", "bypass"), "Boolean", { name = "delay_bypass" })
+        Bind(Controls.delay, BlockControl("delay", { "delay.1", "delay" }), "Value", { name = "delay" })
+    end
+
+    -- Low / High
+    for _, side in ipairs({ "low", "high" }) do
+        local mode = side == "low" and LOW_MODE or HIGH_MODE
+        if mode ~= SECTION_OFF then
+            local g = { graph = true }
+            Bind(Controls[side .. "_bypass"], BlockControl(side, "bypass"), "Boolean", g)
+            Bind(Controls[side .. "_frequency"], BlockControl(side, "frequency"), "Value", g)
+            Bind(Controls[side .. "_q"], BlockControl(side, "q"), "Value", g)
+            if mode == SECTION_SHELF then
+                Bind(Controls[side .. "_gain"], BlockControl(side, "gain"), "Value", g)
+            else
+                Bind(Controls[side .. "_type"], BlockControl(side, "type"), "String", g)
+                Bind(Controls[side .. "_slope"], BlockControl(side, "slope"), "String", g)
+            end
+        end
+    end
+
+    -- EQ
+    EqGain, EqBypass, EqBandwidth, EqType, EqFrequency = {}, {}, {}, {}, {}
+
+    if EQ_MODE ~= EQ_OFF then
+        local g = { graph = true }
+        Bind(Controls.eq_bypass, BlockControl("eq", "bypass"), "Boolean", g)
+        EqGain = arr(Controls.eq_gain)
+
+        if EQ_MODE == EQ_PARAMETRIC then
+            EqBypass = arr(Controls.eq_band_bypass)
+            EqBandwidth = arr(Controls.eq_bandwidth)
+            EqType = arr(Controls.eq_type)
+            for i = 1, EQ_BANDS do
+                EqFrequency[i] = Controls[EqFrequencyName(EQ_BANDS, i)]
+                Bind(EqBypass[i], BlockControl("eq", "bypass." .. i), "Boolean", g)
+                Bind(EqGain[i], BlockControl("eq", "gain." .. i), "Value", g)
+                Bind(EqFrequency[i], BlockControl("eq", "frequency." .. i), "Value", g)
+                Bind(EqBandwidth[i], BlockControl("eq", "bandwidth." .. i), "Value", g)
+                Bind(EqType[i], BlockControl("eq", "type." .. i), "String", g)
+            end
+        else
+            for i, name in ipairs(GRAPHIC_NAMES) do
+                Bind(EqGain[i], BlockControl("eq", name .. ".gain"), "Value", g)
+            end
+        end
+
+        Controls.eq_flat.EventHandler = function()
+            for _, ctl in ipairs(EqGain) do
+                ctl.Value = 0
+                if ctl.EventHandler then ctl.EventHandler(ctl) end
+            end
+            log("EQ flat")
+        end
+    end
+
+    -- Limiter
+    LimiterGr = nil
+    if HasSection(Properties, "limiter") then
+        Bind(Controls.limiter_bypass, BlockControl("limiter", "bypass"), "Boolean", { name = "limiter_bypass" })
+        Bind(Controls.limiter_threshold, BlockControl("limiter", "threshold.level"), "Value", { name = "limiter_threshold" })
+        Bind(Controls.limiter_attack, BlockControl("limiter", "attack"), "Value", { name = "limiter_attack" })
+        Bind(Controls.limiter_release, BlockControl("limiter", "release"), "Value", { name = "limiter_release" })
+        LimiterGr = BlockControl("limiter", { "applied.gain", "applied.gain.1" })
+    end
+
+
+    ------------------------------------------------------------
+    -- Meters
+    ------------------------------------------------------------
+
+    MeterLinks = {}
+
+    for _, tap in ipairs(TAPS) do
+        local block = _G[MeterBlock(tap.id)]
+        local plugin = arr(Controls[MeterControl(tap.id)])
+        if not block then
+            Problem(MeterBlock(tap.id))
+        else
+            for ch = 1, CHANNELS do
+                local ok, source = pcall(function() return block["meter." .. ch] end)
+                if ok and source and plugin[ch] then
+                    MeterLinks[#MeterLinks + 1] = { source, plugin[ch] }
+                elseif ch == 1 then
+                    Problem(MeterBlock(tap.id) .. ".meter.1")
+                end
+            end
+        end
+    end
+
+    MeterTimer = Timer.New()
+    MeterTimer.EventHandler = function()
+        for _, link in ipairs(MeterLinks) do
+            link[2].Value = link[1].Value
+        end
+        if LimiterGr then
+            Controls.limiter_gr.Value = Clamp(LimiterGr.Value, GR_MIN, GR_MAX)
+        end
+    end
+    MeterTimer:Start(0.05)
+
+
+    ------------------------------------------------------------
+    -- Response graph
+    ------------------------------------------------------------
+
+    GRAPH_POINTS = 240
+
+    function SlopeOf(ctl, default)
+        local n = ctl and tonumber((ctl.String or ""):match("(%d+)"))
+        return n or default
+    end
+
+
+    -- List of curves, each a function f -> dB, for enabled, unbypassed stages.
+    function Curves()
+        local curves = {}
+
+        for _, side in ipairs({ "low", "high" }) do
+            local mode = side == "low" and LOW_MODE or HIGH_MODE
+            if mode ~= SECTION_OFF and not Controls[side .. "_bypass"].Boolean then
+                local f0 = Controls[side .. "_frequency"].Value
+                local q = Controls[side .. "_q"].Value
+                local high = side == "high"
+                if mode == SECTION_SHELF then
+                    local gain = Controls[side .. "_gain"].Value
+                    local prefix = high and "High" or "Low"
+                    if PropValue(Properties, prefix .. " Shelf Slope", "12dB/Oct") == "6dB/Oct" then
+                        curves[#curves + 1] = { color = "#7fd4ff", fn = function(f) return FirstOrderShelfDb(high, f0, gain, f) end }
+                    else
+                        local c = ShelfCoefs(high, f0, gain, q)
+                        curves[#curves + 1] = { color = "#7fd4ff", fn = function(f) return BiquadDb(c, f) end }
+                    end
+                else
+                    local prefix = high and "High" or "Low"
+                    local slope = SlopeOf(Controls[side .. "_slope"], tonumber(PropValue(Properties, prefix .. " Filter Max Slope", "24")) or 24)
+                    local ftype = Controls[side .. "_type"].String
+                    curves[#curves + 1] = { color = "#7fd4ff", fn = function(f) return PassFilterDb(high, f0, slope, ftype, q, f) end }
+                end
+            end
+        end
+
+        if EQ_MODE ~= EQ_OFF and not Controls.eq_bypass.Boolean then
+            if EQ_MODE == EQ_PARAMETRIC then
+                for i = 1, EQ_BANDS do
+                    if not EqBypass[i].Boolean then
+                        local f0, gain, bw = EqFrequency[i].Value, EqGain[i].Value, EqBandwidth[i].Value
+                        local t = EqType[i].String or ""
+                        local c
+                        if t:find("Low") then
+                            c = ShelfCoefs(false, f0, gain, 0.707)
+                        elseif t:find("High") then
+                            c = ShelfCoefs(true, f0, gain, 0.707)
+                        else
+                            c = PeakingCoefs(f0, gain, bw)
+                        end
+                        curves[#curves + 1] = { color = "#ffd76a", band = i, f0 = f0, gain = gain,
+                                                fn = function(f) return BiquadDb(c, f) end }
+                    end
+                end
+            else
+                local bw = GRAPHIC_STEP_N / 3
+                for i, name in ipairs(GRAPHIC_NAMES) do
+                    local gain = EqGain[i].Value
+                    if gain ~= 0 then
+                        local c = PeakingCoefs(BandFrequency(name), gain, bw)
+                        curves[#curves + 1] = { color = "#ffd76a", fn = function(f) return BiquadDb(c, f) end, quiet = true }
+                    end
+                end
+            end
+        end
+
+        return curves
+    end
+
+
+    function SvgLib()
+        local ok, lib = pcall(require, "EzSVG")
+        if ok and type(lib) == "table" and lib.Document then return lib end
+        return NewSvgWriter()
+    end
+
+    Svg = SvgLib()
+
+
+    function RenderGraph(lib, w, h)
+        local doc = lib.Document(w, h)
+        doc:add(lib.Rect(0, 0, w, h, 0, 0, { fill = "#1e2026", stroke = "none" }))
+
+        local function px(f) return GraphX(f, 0, w) end
+        local function py(db) return GraphY(db, 0, h) end
+
+        -- Grid: 1-2-5 decades bright, other multiples faint; dB every 5.
+        for _, decade in ipairs({ 10, 100, 1000, 10000 }) do
+            for m = 1, 9 do
+                local f = decade * m
+                if f >= GRAPH_FMIN and f <= GRAPH_FMAX then
+                    local strong = (m == 1 or m == 2 or m == 5)
+                    doc:add(lib.Line(px(f), 0, px(f), h, { stroke = strong and "#4a4e58" or "#30333b", stroke_width = 1 }))
+                end
+            end
+        end
+        for db = -GRAPH_DB, GRAPH_DB, 5 do
+            doc:add(lib.Line(0, py(db), w, py(db), { stroke = db == 0 and "#6a707c" or "#30333b", stroke_width = 1 }))
+        end
+
+        local curves = Curves()
+        local freqs = {}
+        for i = 0, GRAPH_POINTS do
+            freqs[i] = GRAPH_FMIN * (GRAPH_FMAX / GRAPH_FMIN) ^ (i / GRAPH_POINTS)
+        end
+
+        -- Individual stages, faint.
+        for _, curve in ipairs(curves) do
+            if not curve.quiet then
+                local p = lib.Path({ stroke = curve.color, stroke_width = 1, stroke_opacity = 0.45, fill = "none" })
+                for i = 0, GRAPH_POINTS do
+                    local x, y = px(freqs[i]), py(curve.fn(freqs[i]))
+                    if i == 0 then p:moveToA(x, y) else p:lineToA(x, y) end
+                end
+                doc:add(p)
+            end
+        end
+
+        -- Combined response.
+        local total = lib.Path({ stroke = "#ffffff", stroke_width = 2, fill = "none" })
+        for i = 0, GRAPH_POINTS do
+            local db = 0
+            for _, curve in ipairs(curves) do db = db + curve.fn(freqs[i]) end
+            local x, y = px(freqs[i]), py(db)
+            if i == 0 then total:moveToA(x, y) else total:lineToA(x, y) end
+        end
+        doc:add(total)
+
+        -- Parametric band handles.
+        for _, curve in ipairs(curves) do
+            if curve.band then
+                doc:add(lib.Circle(px(Clamp(curve.f0, GRAPH_FMIN, GRAPH_FMAX)), py(curve.gain), 4,
+                    { fill = curve.color, stroke = "#1e2026", stroke_width = 1 }))
+            end
+        end
+
+        return doc:toString()
+    end
+
+
+    function DrawGraph()
+        if not Controls.eq_graph then return end
+        local _, _, w, h = GraphRect(EqPage(Properties))
+
+        local ok, svg = pcall(RenderGraph, Svg, w, h)
+        if not ok then
+            log("EzSVG render failed, using built-in writer:", svg)
+            Svg = NewSvgWriter()
+            ok, svg = pcall(RenderGraph, Svg, w, h)
+        end
+        if not ok then
+            print("Output Channel Strip: graph render failed: " .. tostring(svg))
+            return
+        end
+
+        Controls.eq_graph.Legend = rapidjson.encode({ DrawChrome = false, Legend = "", IconData = Crypto.Base64Encode(svg) })
+    end
+
+
+    UpdateStatus()
+    DrawGraph()
+    log("started:", CHANNELS, "channels,", #SECTIONS, "sections,", #MeterLinks, "meter links")
+
+end
