@@ -26,9 +26,9 @@
 -- close approximation of the native response panel, not a measurement.
 
 PluginInfo = {
-    Name = "Output Channel Strip",
-    Version = "1.0.11",
-    BuildVersion = "1.0.11",
+    Name = "Audio~Output Channel Strip",
+    Version = "1.0.13",
+    BuildVersion = "1.0.13",
     Id = "1697da51-87cc-40a5-89fe-9a795dac3853",
     Author = "James Martin",
     Description = "Output channel strip: gain, delay, low/high shelf or filter, parametric or graphic EQ, peak limiter, with meters between every section."
@@ -298,19 +298,19 @@ end
 
 function GetProperties()
     return {
-        { Name = "Channel Count", Type = "integer", Min = 1, Max = MAX_CHANNELS, Value = 2 },
-        { Name = "Single Meter", Type = "boolean", Value = true },
-        { Name = "Max Delay (ms)", Type = "integer", Min = 1, Max = 2000, Value = 100 },
-        { Name = "Low Section", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
-        { Name = "Low Shelf Slope", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
-        { Name = "Low Filter Max Slope", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
-        { Name = "EQ Type", Type = "enum", Choices = { EQ_PARAMETRIC, EQ_GRAPHIC, EQ_OFF }, Value = EQ_PARAMETRIC },
-        { Name = "Parametric Bands", Type = "integer", Min = 1, Max = 16, Value = 4 },
-        { Name = "Graphic Bands", Type = "enum", Choices = { "6", "11", "16", "31" }, Value = "31" },
-        { Name = "High Section", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
-        { Name = "High Shelf Slope", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
-        { Name = "High Filter Max Slope", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
-        { Name = "Debug Print", Type = "boolean", Value = false }
+        { Name = "Channel Count", Header = "Channels & Metering", Type = "integer", Min = 1, Max = MAX_CHANNELS, Value = 2 },
+        { Name = "Single Meter", Header = "Channels & Metering", Type = "boolean", Value = true },
+        { Name = "Max Delay (ms)", Header = "Delay", Type = "integer", Min = 1, Max = 2000, Value = 100 },
+        { Name = "Low Section", Header = "Low Processing", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
+        { Name = "Low Shelf Slope", Header = "Low Processing", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
+        { Name = "Low Filter Max Slope", Header = "Low Processing", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
+        { Name = "EQ Type", Header = "EQ", Type = "enum", Choices = { EQ_PARAMETRIC, EQ_GRAPHIC, EQ_OFF }, Value = EQ_PARAMETRIC },
+        { Name = "Parametric Bands", Header = "EQ", Type = "integer", Min = 1, Max = 16, Value = 4 },
+        { Name = "Graphic Bands", Header = "EQ", Type = "enum", Choices = { "6", "11", "16", "31" }, Value = "31" },
+        { Name = "High Section", Header = "High Processing", Type = "enum", Choices = { SECTION_SHELF, SECTION_FILTER, SECTION_OFF }, Value = SECTION_SHELF },
+        { Name = "High Shelf Slope", Header = "High Processing", Type = "enum", Choices = { "6dB/Oct", "12dB/Oct" }, Value = "12dB/Oct" },
+        { Name = "High Filter Max Slope", Header = "High Processing", Type = "enum", Choices = { "12", "24", "36", "48", "60", "72", "84", "96" }, Value = "48" },
+        { Name = "Debug Print", Header = "Diagnostics", Type = "boolean", Value = false }
     }
 end
 
@@ -468,7 +468,15 @@ end
 ------------------------------------------------------------
 
 function GetControls(props)
-    local controls = {}
+    local controls = {
+        {
+            Name = "Combo1",
+            ControlType = "Text",
+            Count = 1,
+            UserPin = true,
+            PinStyle = "Both",
+        },
+    }
     local minDb, maxDb = GainRange(props)
 
     local function add(t)
@@ -973,6 +981,14 @@ function GetControlLayout(props)
     else
         StripPage(props, layout, graphics)
     end
+
+    table.insert(graphics, { Type = "Label", Text = "Label", Position = { 375, 270 }, Size = { 80, 20 } })
+    layout["Combo1"] = {
+        PrettyName = "Combo1",
+        Style = "ComboBox",
+        Position = { 355, 265 },
+        Size = { 120, 24 },
+    }
 
     return layout, graphics
 end
